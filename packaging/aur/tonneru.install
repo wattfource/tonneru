@@ -1,0 +1,44 @@
+post_install() {
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║                      tonneru installed                       ║"
+    echo "╠══════════════════════════════════════════════════════════════╣"
+    echo "║                                                              ║"
+    echo "║  QUICK START:                                                ║"
+    echo "║    tonneru              Launch TUI                           ║"
+    echo "║                                                              ║"
+    echo "║  ENABLE DAEMON (auto-connect based on network rules):        ║"
+    echo "║    systemctl --user enable --now tonneru.service             ║"
+    echo "║                                                              ║"
+    echo "║  PASSWORDLESS OPERATION:                                     ║"
+    echo "║    Your user must be in the 'wheel' group:                   ║"
+    echo "║    sudo usermod -aG wheel \$USER                              ║"
+    echo "║    (then log out and back in)                                ║"
+    echo "║                                                              ║"
+    echo "║  WAYBAR INTEGRATION:                                         ║"
+    echo "║    See /usr/share/doc/tonneru/examples/                      ║"
+    echo "║                                                              ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+}
+
+post_upgrade() {
+    echo ""
+    echo ">>> tonneru upgraded to version $1"
+    echo ""
+    echo "    Restart the daemon if running:"
+    echo "    systemctl --user restart tonneru.service"
+    echo ""
+}
+
+post_remove() {
+    echo ""
+    echo ">>> tonneru removed"
+    echo ""
+    echo "    Stop the daemon:"
+    echo "    systemctl --user disable --now tonneru.service"
+    echo ""
+    echo "    User config remains at: ~/.config/tonneru/"
+    echo "    WireGuard configs remain at: /etc/wireguard/"
+    echo ""
+}

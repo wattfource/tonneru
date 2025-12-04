@@ -1,0 +1,25 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Note: Cargo.lock is INCLUDED for binary crates (not ignored)
+# This ensures reproducible builds for AUR packaging
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cursor/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.log
+
+# Local testing
+*.local
+.env

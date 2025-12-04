@@ -1,0 +1,23 @@
+[Unit]
+Description=Tonneru VPN Manager Daemon
+Documentation=https://github.com/WattForce/tonneru
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tonneru --daemon
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tonneru
+
+# Environment
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
+

@@ -1,0 +1,31 @@
+# Sudoers configuration for tonneru VPN manager
+# Install to: /etc/sudoers.d/tonneru
+# Permissions: 0440, owned by root:root
+#
+# This allows members of the wheel group to manage WireGuard VPN
+# connections without entering a password.
+#
+# SECURITY NOTE: This grants passwordless root access to specific
+# WireGuard and firewall commands. Only install if you trust all
+# users in the wheel group.
+
+# WireGuard connection management
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/wg-quick up *
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/wg-quick down *
+
+# WireGuard status (may need root for full output)  
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/wg show
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/wg show *
+
+# nftables firewall rules for kill switch
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/nft -f /tmp/tonneru-killswitch.nft
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/nft delete table inet tonneru_killswitch
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/nft list table inet tonneru_killswitch
+
+# Config file management (restricted to /etc/wireguard)
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/ls -1 /etc/wireguard
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/wireguard/*.conf
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/wireguard/*.conf
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/chmod 600 /etc/wireguard/*.conf
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p /etc/wireguard
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/cat /etc/wireguard/*.conf

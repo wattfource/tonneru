@@ -1,0 +1,51 @@
+[package]
+name = "tonneru"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sean Fournier <me@seanfournier.com>"]
+description = "A terminal-friendly VPN manager for Arch Linux / Omarchy"
+license = "WTFPL"
+repository = "https://github.com/WattForce/tonneru"
+homepage = "https://github.com/WattForce/tonneru"
+keywords = ["vpn", "wireguard", "tui", "arch-linux", "omarchy"]
+categories = ["command-line-utilities", "network-programming"]
+readme = "README.md"
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# System interaction (removed unused: dbus, networkmanager, nix)
+
+# Notifications
+notify-rust = "4.11"
+
+# Config paths
+dirs = "5.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI args
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
+panic = "abort"
+

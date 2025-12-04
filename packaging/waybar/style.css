@@ -1,0 +1,9 @@
+/* Waybar CSS for tonneru VPN module */
+/* Add to your ~/.config/waybar/style.css */
+
+/* Uses filled/outline icons instead of colors (Omarchy convention) */
+/* 󰌾 = filled shield (connected), 󰒖 = outline shield (disconnected) */
+#custom-vpn {
+    padding: 0 10px;
+    margin: 0 4px;
+}

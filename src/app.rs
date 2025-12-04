@@ -1,0 +1,1311 @@
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::Instant;
+
+use crate::config::{AppConfig, NetworkRule};
+use crate::network::{NetworkInfo, ConnectivityStatus};
+use crate::vpn::wireguard::{WgProfile, WgStatus, VpnHealthCheck};
+
+/// Pending configuration change that will be applied after countdown
+#[derive(Debug, Clone)]
+pub struct PendingChange {
+    #[allow(dead_code)]
+    pub network_id: String,      // Reserved for future logging/display
+    #[allow(dead_code)]
+    pub network_name: String,    // Reserved for future logging/display
+    pub tunnel_name: Option<String>,
+    pub action: PendingAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PendingAction {
+    Connect,          // Connect to tunnel
+    Disconnect,       // Disconnect from tunnel
+    Reconnect,        // Disconnect then connect (tunnel changed)
+    KillSwitchOn,     // Enable kill switch
+    KillSwitchOff,    // Disable kill switch
+}
+
+/// Countdown duration in seconds before applying changes
+const COUNTDOWN_SECONDS: u64 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Networks,
+    Tunnels,
+    TunnelConfig,  // Config editor panel
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Popup {
+    None,
+    FileBrowser,
+    ConfigPreview,
+    Help,
+    Confirm,
+}
+
+pub struct App {
+    pub section: Section,
+    pub popup: Popup,
+
+    // Network state (top section)
+    pub networks: Vec<NetworkInfo>,
+    pub selected_network: usize,
+
+    // Tunnel state (middle section) 
+    pub tunnels: Vec<WgProfile>,
+    pub selected_tunnel: usize,
+    pub vpn_status: WgStatus,
+
+    // Network rules (which tunnel for which network)
+    pub network_rules: Vec<NetworkRule>,
+
+    // Config
+    pub config: AppConfig,
+
+    // Input buffers
+    pub input_buffer: String,
+    pub config_preview: String,
+    pub preview_name: String,
+    pub preview_field: usize,  // 0 = name, 1 = save/cancel buttons
+
+    // Status message
+    pub status_message: Option<String>,
+
+    // Kill switch
+    pub kill_switch_enabled: bool,
+
+    // File browser state
+    pub browser_path: std::path::PathBuf,
+    pub browser_entries: Vec<BrowserEntry>,
+    pub browser_selected: usize,
+
+    // Tunnel config editor (right side of tunnels box)
+    pub tunnel_config_content: String,
+    pub tunnel_config_original: String,  // To detect changes
+    pub tunnel_config_cursor: usize,     // Cursor position in text
+    pub tunnel_config_scroll: usize,     // Scroll offset for display
+    pub tunnel_config_modified: bool,    // Has unsaved changes
+    pub show_config: bool,               // Whether config panel is expanded
+
+    // Pending change countdown (3 second delay before applying rule/tunnel changes)
+    pub pending_change: Option<PendingChange>,
+    pub countdown_start: Option<Instant>,
+    pub countdown_seconds: u8,           // Current countdown value for display
+
+    // Info line content
+    pub info_message: Option<String>,    // Current info message (traffic, status, etc.)
+
+    // Session tracking (for traffic stats)
+    pub session_start: Instant,          // When app/VPN session started
+    pub session_baseline_rx: u64,        // RX bytes at session start
+    pub session_baseline_tx: u64,        // TX bytes at session start
+    pub session_interface: Option<String>, // Which interface we're tracking
+    
+    // Rate limiting for status refresh
+    pub last_status_refresh: Instant,    // When we last refreshed VPN status
+    
+    // Network connectivity status
+    pub connectivity: ConnectivityStatus, // Current internet connectivity
+    pub last_connectivity_check: Instant, // When we last checked connectivity
+    pub vpn_health: VpnHealthCheck,       // Detailed VPN health status
+    pub last_health_check: Instant,       // When we last did a full health check
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub path: std::path::PathBuf,
+}
+
+impl App {
+    pub async fn new() -> Result<Self> {
+        let config = AppConfig::load().unwrap_or_default();
+        let tunnels = crate::vpn::wireguard::list_profiles().await.unwrap_or_default();
+        let vpn_status = crate::vpn::wireguard::get_status().await.unwrap_or_default();
+        let networks = crate::network::get_networks().await.unwrap_or_default();
+        
+        // Get initial connectivity status
+        let connectivity = crate::network::check_connectivity().await;
+        let vpn_health = crate::vpn::wireguard::health_check().await;
+
+        Ok(Self {
+            section: Section::Networks,
+            popup: Popup::None,
+
+            networks,
+            selected_network: 0,
+
+            tunnels,
+            selected_tunnel: 0,
+            vpn_status,
+
+            network_rules: config.network_rules.clone(),
+
+            config,
+
+            input_buffer: String::new(),
+            config_preview: String::new(),
+            preview_name: String::new(),
+            preview_field: 0,
+
+            status_message: None,
+            kill_switch_enabled: false,
+
+            browser_path: dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
+            browser_entries: Vec::new(),
+            browser_selected: 0,
+
+            tunnel_config_content: String::new(),
+            tunnel_config_original: String::new(),
+            tunnel_config_cursor: 0,
+            tunnel_config_scroll: 0,
+            tunnel_config_modified: false,
+            show_config: false,
+
+            pending_change: None,
+            countdown_start: None,
+            countdown_seconds: 0,
+            info_message: None,
+
+            session_start: Instant::now(),
+            session_baseline_rx: 0,
+            session_baseline_tx: 0,
+            session_interface: None,
+            last_status_refresh: Instant::now(),
+            
+            connectivity,
+            last_connectivity_check: Instant::now(),
+            vpn_health,
+            last_health_check: Instant::now(),
+        })
+    }
+
+    /// Load the config file for the currently selected tunnel
+    pub fn load_selected_tunnel_config(&mut self) {
+        if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
+            let config_path = format!("/etc/wireguard/{}.conf", tunnel.name);
+            
+            // Try to read the file (may need sudo)
+            let output = std::process::Command::new("sudo")
+                .args(["cat", &config_path])
+                .output();
+
+            match output {
+                Ok(output) if output.status.success() => {
+                    let content = String::from_utf8_lossy(&output.stdout).to_string();
+                    self.tunnel_config_content = content.clone();
+                    self.tunnel_config_original = content;
+                    self.tunnel_config_cursor = 0;
+                    self.tunnel_config_scroll = 0;
+                    self.tunnel_config_modified = false;
+                }
+                _ => {
+                    self.tunnel_config_content = "# Unable to load config\n# Check permissions".to_string();
+                    self.tunnel_config_original = self.tunnel_config_content.clone();
+                    self.tunnel_config_modified = false;
+                }
+            }
+        } else {
+            self.tunnel_config_content.clear();
+            self.tunnel_config_original.clear();
+            self.tunnel_config_modified = false;
+        }
+    }
+
+    /// Save the edited tunnel config
+    pub async fn save_tunnel_config(&mut self) -> Result<()> {
+        if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
+            let tunnel_name = tunnel.name.clone();
+            let was_connected = tunnel.connected;
+            
+            // Disconnect first if connected
+            if was_connected {
+                let _ = crate::vpn::wireguard::disconnect().await;
+                self.status_message = Some(format!("Disconnecting {} to apply changes...", tunnel_name));
+            }
+
+            // Save using the add_profile function (handles sudo)
+            match crate::vpn::wireguard::add_profile(&tunnel_name, &self.tunnel_config_content).await {
+                Ok(_) => {
+                    self.tunnel_config_original = self.tunnel_config_content.clone();
+                    self.tunnel_config_modified = false;
+                    
+                    // Reconnect if was connected
+                    if was_connected {
+                        match crate::vpn::wireguard::connect(&tunnel_name).await {
+                            Ok(_) => {
+                                self.status_message = Some(format!("Config saved & {} reconnected", tunnel_name));
+                            }
+                            Err(e) => {
+                                self.status_message = Some(format!("Saved but reconnect failed: {}", e));
+                            }
+                        }
+                    } else {
+                        self.status_message = Some(format!("Config saved for {}", tunnel_name));
+                    }
+                    
+                    self.refresh().await?;
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("Save failed: {}", e));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Handle popups first
+        if self.popup != Popup::None {
+            return self.handle_popup_key(key).await;
+        }
+
+        // Handle normal key input
+        self.handle_normal_key(key).await
+    }
+
+    async fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Handle TunnelConfig editing separately when config is expanded
+        if self.section == Section::TunnelConfig && self.show_config {
+            return self.handle_tunnel_config_key(key).await;
+        }
+
+        // Escape cancels pending change
+        if key.code == KeyCode::Esc && self.pending_change.is_some() {
+            self.cancel_pending_change();
+            self.status_message = Some("Change cancelled".to_string());
+            return Ok(());
+        }
+
+        match key.code {
+            // Navigation between sections (Networks ↔ Tunnels)
+            KeyCode::Tab => {
+                self.section = match self.section {
+                    Section::Networks => Section::Tunnels,
+                    Section::Tunnels => Section::Networks,
+                    Section::TunnelConfig => {
+                        // Collapse config when tabbing out
+                        self.show_config = false;
+                        Section::Networks
+                    }
+                };
+            }
+            KeyCode::BackTab => {
+                self.section = match self.section {
+                    Section::Networks => Section::Tunnels,
+                    Section::Tunnels => Section::Networks,
+                    Section::TunnelConfig => {
+                        // Collapse config when tabbing out
+                        self.show_config = false;
+                        Section::Tunnels
+                    }
+                };
+            }
+
+            // Vertical navigation (j/down, up only - 'k' is for kill switch)
+            KeyCode::Char('j') | KeyCode::Down => self.move_down(),
+            KeyCode::Up => self.move_up(),
+
+            // Actions based on section
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                // Space/Enter = connect/use tunnel now
+                self.use_tunnel_now().await?;
+            }
+
+            // Expand config panel (only in Tunnels section)
+            KeyCode::Char('c') => {
+                if self.section == Section::Tunnels && !self.tunnels.is_empty() {
+                    self.load_selected_tunnel_config();
+                    self.show_config = true;
+                    self.section = Section::TunnelConfig;
+                }
+            }
+
+            // File browser for importing
+            KeyCode::Char('f') => self.start_file_browser(),
+            
+            // Delete/remove
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                self.delete_selection().await?;
+            }
+            
+            // Refresh
+            KeyCode::Char('R') => self.refresh().await?,
+            
+            // Toggle rule (cycle through: none -> always -> never -> none)
+            KeyCode::Char('r') => self.cycle_tunnel_rule().await?,
+            
+            // Cycle through tunnels for selected network
+            KeyCode::Char('t') => self.cycle_network_tunnel().await?,
+            
+            // Kill switch
+            // Kill switch toggle (in Tunnels section)
+            KeyCode::Char('k') => {
+                if self.section == Section::Tunnels {
+                    self.toggle_kill_switch().await?;
+                }
+            }
+            
+            // Help
+            KeyCode::Char('?') => self.popup = Popup::Help,
+
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_tunnel_config_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Ctrl+S to save
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.save_tunnel_config().await?;
+            return Ok(());
+        }
+
+        match key.code {
+            // Tab/BackTab to collapse config and navigate away
+            KeyCode::Tab => {
+                self.show_config = false;
+                self.section = Section::Networks;
+            }
+            KeyCode::BackTab => {
+                self.show_config = false;
+                self.section = Section::Tunnels;
+            }
+            
+            // Escape to discard changes, collapse, and go back
+            KeyCode::Esc => {
+                if self.tunnel_config_modified {
+                    // Reload original
+                    self.tunnel_config_content = self.tunnel_config_original.clone();
+                    self.tunnel_config_modified = false;
+                    self.status_message = Some("Changes discarded".to_string());
+                }
+                self.show_config = false;
+                self.section = Section::Tunnels;
+            }
+
+            // Arrow keys for navigation
+            KeyCode::Up => {
+                if self.tunnel_config_scroll > 0 {
+                    self.tunnel_config_scroll -= 1;
+                }
+            }
+            KeyCode::Down => {
+                let lines: Vec<&str> = self.tunnel_config_content.lines().collect();
+                if self.tunnel_config_scroll < lines.len().saturating_sub(1) {
+                    self.tunnel_config_scroll += 1;
+                }
+            }
+
+            // Enter to add newline
+            KeyCode::Enter => {
+                self.tunnel_config_content.push('\n');
+                self.tunnel_config_modified = true;
+            }
+
+            // Backspace to delete
+            KeyCode::Backspace => {
+                if !self.tunnel_config_content.is_empty() {
+                    self.tunnel_config_content.pop();
+                    self.tunnel_config_modified = true;
+                }
+            }
+
+            // Character input
+            KeyCode::Char(c) => {
+                self.tunnel_config_content.push(c);
+                self.tunnel_config_modified = true;
+            }
+
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_popup_key(&mut self, key: KeyEvent) -> Result<()> {
+        match self.popup {
+            Popup::FileBrowser => self.handle_browser_key(key).await,
+            Popup::ConfigPreview => self.handle_preview_key(key).await,
+            Popup::Help => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q')) {
+                    self.popup = Popup::None;
+                }
+                Ok(())
+            }
+            Popup::Confirm => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => {
+                        self.confirm_action().await?;
+                        self.popup = Popup::None;
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        self.popup = Popup::None;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn move_down(&mut self) {
+        match self.section {
+            Section::Networks => {
+                if !self.networks.is_empty() {
+                    self.selected_network = (self.selected_network + 1) % self.networks.len();
+                }
+            }
+            Section::Tunnels => {
+                if !self.tunnels.is_empty() {
+                    let old_selection = self.selected_tunnel;
+                    self.selected_tunnel = (self.selected_tunnel + 1) % self.tunnels.len();
+                    // Load config if selection changed
+                    if old_selection != self.selected_tunnel {
+                        self.load_selected_tunnel_config();
+                    }
+                }
+            }
+            Section::TunnelConfig => {
+                // Scroll down in config editor
+                let lines: Vec<&str> = self.tunnel_config_content.lines().collect();
+                if self.tunnel_config_scroll < lines.len().saturating_sub(1) {
+                    self.tunnel_config_scroll += 1;
+                }
+            }
+        }
+    }
+
+    fn move_up(&mut self) {
+        match self.section {
+            Section::Networks => {
+                if !self.networks.is_empty() {
+                    self.selected_network = self.selected_network.checked_sub(1).unwrap_or(self.networks.len() - 1);
+                }
+            }
+            Section::Tunnels => {
+                if !self.tunnels.is_empty() {
+                    let old_selection = self.selected_tunnel;
+                    self.selected_tunnel = self.selected_tunnel.checked_sub(1).unwrap_or(self.tunnels.len() - 1);
+                    // Load config if selection changed
+                    if old_selection != self.selected_tunnel {
+                        self.load_selected_tunnel_config();
+                    }
+                }
+            }
+            Section::TunnelConfig => {
+                // Scroll up in config editor
+                if self.tunnel_config_scroll > 0 {
+                    self.tunnel_config_scroll -= 1;
+                }
+            }
+        }
+    }
+
+    /// Connect to the selected tunnel now (one-time)
+    async fn use_tunnel_now(&mut self) -> Result<()> {
+        if self.section != Section::Tunnels {
+            return Ok(());
+        }
+
+        if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
+            if self.vpn_status.connected && self.vpn_status.interface.as_deref() == Some(&tunnel.name) {
+                // Already connected, disconnect
+                crate::vpn::wireguard::disconnect().await?;
+                self.status_message = Some("Disconnected".to_string());
+            } else {
+                // Disconnect any existing first
+                if self.vpn_status.connected {
+                    crate::vpn::wireguard::disconnect().await?;
+                }
+                crate::vpn::wireguard::connect(&tunnel.name).await?;
+                self.status_message = Some(format!("Connected to {}", tunnel.name));
+            }
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    /// Cycle through tunnel rules: none -> always -> never -> session -> none
+    /// Works from Networks section, preserves tunnel selection
+    /// For active networks, schedules a pending change with 3-second countdown
+    async fn cycle_tunnel_rule(&mut self) -> Result<()> {
+        // Only works in Networks section
+        if self.section != Section::Networks {
+            return Ok(());
+        }
+
+        let network = match self.networks.get(self.selected_network) {
+            Some(n) => n.clone(),
+            None => return Ok(()),
+        };
+
+        let identifier = network.identifier();
+        let is_active = network.connected;
+
+        // Find current rule
+        let current_rule = self.network_rules
+            .iter()
+            .find(|r| r.identifier == identifier)
+            .cloned();
+
+        // Remove old rule
+        self.network_rules.retain(|rule| rule.identifier != identifier);
+
+        // Determine the current tunnel (preserve it across rule changes)
+        let current_tunnel = current_rule.as_ref().and_then(|r| r.tunnel_name.clone());
+
+        // Determine new rule and what action to take
+        let (new_rule, action, status_text) = match current_rule {
+            None => {
+                // No rule -> Always (with first tunnel if none set)
+                let tunnel_name = current_tunnel.or_else(|| {
+                    self.tunnels.first().map(|t| t.name.clone())
+                });
+                let rule = NetworkRule {
+                    identifier: identifier.clone(),
+                    tunnel_name: tunnel_name.clone(),
+                    always_vpn: true,
+                    never_vpn: false,
+                    session_vpn: false,
+                };
+                let action = if tunnel_name.is_some() { Some(PendingAction::Connect) } else { None };
+                (Some(rule), action, format!("{}: Always", network.name))
+            }
+            Some(r) if r.always_vpn => {
+                // Always -> Never (preserve tunnel, disconnect)
+                let rule = NetworkRule {
+                    identifier: identifier.clone(),
+                    tunnel_name: current_tunnel,
+                    always_vpn: false,
+                    never_vpn: true,
+                    session_vpn: false,
+                };
+                (Some(rule), Some(PendingAction::Disconnect), format!("{}: Never", network.name))
+            }
+            Some(r) if r.never_vpn => {
+                // Never -> Session (preserve tunnel, connect)
+                let tunnel = current_tunnel.clone();
+                let rule = NetworkRule {
+                    identifier: identifier.clone(),
+                    tunnel_name: tunnel.clone(),
+                    always_vpn: false,
+                    never_vpn: false,
+                    session_vpn: true,
+                };
+                let action = if tunnel.is_some() { Some(PendingAction::Connect) } else { None };
+                (Some(rule), action, format!("{}: Session", network.name))
+            }
+            Some(_) => {
+                // Session -> None (remove rule, disconnect)
+                (None, Some(PendingAction::Disconnect), format!("{}: No rule", network.name))
+            }
+        };
+
+        // Apply the new rule to config
+        if let Some(rule) = new_rule {
+            self.network_rules.push(rule);
+        }
+        self.config.network_rules = self.network_rules.clone();
+        self.config.save()?;
+
+        // For active networks, schedule the action with countdown
+        if is_active {
+            if let Some(act) = action {
+                let tunnel_name = self.network_rules
+                    .iter()
+                    .find(|r| r.identifier == identifier)
+                    .and_then(|r| r.tunnel_name.clone());
+                
+                self.schedule_change(PendingChange {
+                    network_id: identifier,
+                    network_name: network.name.clone(),
+                    tunnel_name,
+                    action: act,
+                });
+            }
+        }
+
+        self.status_message = Some(status_text);
+        Ok(())
+    }
+
+    /// Cycle through available tunnels for the selected network
+    /// Preserves the Always/Never/Session rule setting
+    /// For active networks with active rules, schedules reconnect with countdown
+    async fn cycle_network_tunnel(&mut self) -> Result<()> {
+        // Only works in Networks section
+        if self.section != Section::Networks {
+            return Ok(());
+        }
+
+        let network = match self.networks.get(self.selected_network) {
+            Some(n) => n.clone(),
+            None => return Ok(()),
+        };
+
+        if self.tunnels.is_empty() {
+            self.status_message = Some("No tunnels. Press 'f' to import.".to_string());
+            return Ok(());
+        }
+
+        let identifier = network.identifier();
+        let is_active = network.connected;
+
+        // Find current rule
+        let current_rule = self.network_rules
+            .iter()
+            .find(|r| r.identifier == identifier)
+            .cloned();
+
+        // Get current tunnel index
+        let current_tunnel_idx = current_rule
+            .as_ref()
+            .and_then(|r| r.tunnel_name.as_ref())
+            .and_then(|name| self.tunnels.iter().position(|t| &t.name == name));
+
+        // Calculate next tunnel index (cycle through all tunnels, no "none" option)
+        let next_tunnel_idx = match current_tunnel_idx {
+            Some(idx) => (idx + 1) % self.tunnels.len(),
+            None => 0,
+        };
+
+        let tunnel = &self.tunnels[next_tunnel_idx];
+        let new_tunnel_name = tunnel.name.clone();
+
+        // Preserve rule settings, default to Always if no rule exists
+        let (always_vpn, never_vpn, session_vpn) = current_rule
+            .as_ref()
+            .map(|r| (r.always_vpn, r.never_vpn, r.session_vpn))
+            .unwrap_or((true, false, false)); // Default to Always when first selecting tunnel
+
+        // Remove old rule and add new one
+        self.network_rules.retain(|r| r.identifier != identifier);
+        self.network_rules.push(NetworkRule {
+            identifier: identifier.clone(),
+            tunnel_name: Some(new_tunnel_name.clone()),
+            always_vpn,
+            never_vpn,
+            session_vpn,
+        });
+
+        let rule_text = if always_vpn { "Always" } else if session_vpn { "Session" } else if never_vpn { "Never" } else { "-" };
+        self.status_message = Some(format!("{}: {} → {}", network.name, rule_text, new_tunnel_name));
+
+        self.config.network_rules = self.network_rules.clone();
+        self.config.save()?;
+
+        // For active networks with a "connect" rule (Always or Session), schedule reconnect
+        if is_active && (always_vpn || session_vpn) {
+            self.schedule_change(PendingChange {
+                network_id: identifier,
+                network_name: network.name.clone(),
+                tunnel_name: Some(new_tunnel_name),
+                action: PendingAction::Reconnect,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn start_file_browser(&mut self) {
+        self.popup = Popup::FileBrowser;
+        self.browser_path = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.browser_selected = 0;
+        self.refresh_browser();
+    }
+
+    fn refresh_browser(&mut self) {
+        self.browser_entries.clear();
+        
+        // Add parent directory entry if not at root
+        if self.browser_path.parent().is_some() {
+            self.browser_entries.push(BrowserEntry {
+                name: "..".to_string(),
+                is_dir: true,
+                path: self.browser_path.parent().unwrap().to_path_buf(),
+            });
+        }
+
+        // Read directory contents
+        if let Ok(entries) = std::fs::read_dir(&self.browser_path) {
+            let mut dirs: Vec<BrowserEntry> = Vec::new();
+            let mut files: Vec<BrowserEntry> = Vec::new();
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                
+                // Skip hidden files
+                if name.starts_with('.') {
+                    continue;
+                }
+
+                if path.is_dir() {
+                    dirs.push(BrowserEntry {
+                        name,
+                        is_dir: true,
+                        path,
+                    });
+                } else if name.ends_with(".conf") {
+                    files.push(BrowserEntry {
+                        name,
+                        is_dir: false,
+                        path,
+                    });
+                }
+            }
+
+            // Sort alphabetically
+            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+            self.browser_entries.extend(dirs);
+            self.browser_entries.extend(files);
+        }
+
+        if self.browser_selected >= self.browser_entries.len() {
+            self.browser_selected = 0;
+        }
+    }
+
+    async fn handle_browser_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.popup = Popup::None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.browser_entries.is_empty() {
+                    self.browser_selected = (self.browser_selected + 1) % self.browser_entries.len();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if !self.browser_entries.is_empty() {
+                    self.browser_selected = self.browser_selected.checked_sub(1)
+                        .unwrap_or(self.browser_entries.len() - 1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(entry) = self.browser_entries.get(self.browser_selected).cloned() {
+                    if entry.is_dir {
+                        self.browser_path = entry.path;
+                        self.browser_selected = 0;
+                        self.refresh_browser();
+                    } else {
+                        // Load file and show preview
+                        self.load_config_preview(&entry.path)?;
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(parent) = self.browser_path.parent() {
+                    self.browser_path = parent.to_path_buf();
+                    self.browser_selected = 0;
+                    self.refresh_browser();
+                }
+            }
+            KeyCode::Char('h') => {
+                self.browser_path = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+                self.browser_selected = 0;
+                self.refresh_browser();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn load_config_preview(&mut self, path: &std::path::Path) -> Result<()> {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                if content.contains("[Interface]") && content.contains("[Peer]") {
+                    self.config_preview = content;
+                    self.preview_name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("tunnel")
+                        .to_string();
+                    self.input_buffer = self.preview_name.clone();
+                    self.popup = Popup::ConfigPreview;
+                    self.preview_field = 0;  // Start on name field
+                } else {
+                    self.status_message = Some("Not a valid WireGuard config".to_string());
+                }
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Cannot read: {}", e));
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_preview_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = Popup::FileBrowser;
+                self.config_preview.clear();
+                self.input_buffer.clear();
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                // Toggle between name field (0) and action buttons (1)
+                self.preview_field = if self.preview_field == 0 { 1 } else { 0 };
+            }
+            KeyCode::Enter => {
+                if self.preview_field == 1 {
+                    // On action bar, Enter = save
+                    self.save_imported_config().await?;
+                } else {
+                    // On name field, Enter moves to action bar
+                    self.preview_field = 1;
+                }
+            }
+            KeyCode::Backspace => {
+                if self.preview_field == 0 {
+                    self.input_buffer.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if self.preview_field == 0 {
+                    // Only allow valid filename characters in name field
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        self.input_buffer.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn save_imported_config(&mut self) -> Result<()> {
+        let name = if self.input_buffer.is_empty() {
+            self.preview_name.clone()
+        } else {
+            self.input_buffer.clone()
+        };
+
+        match crate::vpn::wireguard::add_profile(&name, &self.config_preview).await {
+            Ok(_) => {
+                self.status_message = Some(format!("Saved tunnel: {}", name));
+                let _ = self.refresh().await;
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Failed: {}", e));
+                return Ok(()); // Don't close popup on error
+            }
+        }
+
+        self.popup = Popup::None;
+        self.config_preview.clear();
+        self.input_buffer.clear();
+        Ok(())
+    }
+
+    async fn delete_selection(&mut self) -> Result<()> {
+        match self.section {
+            Section::Tunnels => {
+                if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
+                    self.input_buffer = tunnel.name.clone(); // Store name for confirm
+                    self.status_message = Some(format!("Delete '{}'? (y/n)", tunnel.name));
+                    self.popup = Popup::Confirm;
+                }
+            }
+            Section::TunnelConfig => {
+                // Same as Tunnels - delete the selected tunnel
+                if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
+                    self.input_buffer = tunnel.name.clone();
+                    self.status_message = Some(format!("Delete '{}'? (y/n)", tunnel.name));
+                    self.popup = Popup::Confirm;
+                }
+            }
+            Section::Networks => {
+                // Remove rule for this network
+                if let Some(network) = self.networks.get(self.selected_network) {
+                    let identifier = network.identifier();
+                    self.network_rules.retain(|r| r.identifier != identifier);
+                    self.config.network_rules = self.network_rules.clone();
+                    self.config.save()?;
+                    self.status_message = Some(format!("Rule removed for {}", network.name));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn confirm_action(&mut self) -> Result<()> {
+        let tunnel_name = self.input_buffer.clone();
+        self.input_buffer.clear();
+        
+        if tunnel_name.is_empty() {
+            return Ok(());
+        }
+
+        // Delete the tunnel from /etc/wireguard and our config
+        match crate::vpn::wireguard::delete_profile(&tunnel_name).await {
+            Ok(_) => {
+                // Also remove this tunnel from any network rules
+                for rule in &mut self.network_rules {
+                    if rule.tunnel_name.as_ref() == Some(&tunnel_name) {
+                        rule.tunnel_name = None;
+                    }
+                }
+                self.config.network_rules = self.network_rules.clone();
+                self.config.save()?;
+                
+                self.refresh().await?;
+                self.status_message = Some(format!("Deleted '{}'", tunnel_name));
+                
+                // Adjust selection if needed
+                if self.selected_tunnel >= self.tunnels.len() && !self.tunnels.is_empty() {
+                    self.selected_tunnel = self.tunnels.len() - 1;
+                }
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Delete failed: {}", e));
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh(&mut self) -> Result<()> {
+        self.tunnels = crate::vpn::wireguard::list_profiles().await.unwrap_or_default();
+        self.vpn_status = crate::vpn::wireguard::get_status().await.unwrap_or_default();
+        self.networks = crate::network::get_networks().await.unwrap_or_default();
+        Ok(())
+    }
+
+    async fn toggle_kill_switch(&mut self) -> Result<()> {
+        // Toggle the visual state immediately for feedback
+        let new_state = !self.kill_switch_enabled;
+        
+        // Schedule the change with countdown
+        let action = if new_state {
+            PendingAction::KillSwitchOn
+        } else {
+            PendingAction::KillSwitchOff
+        };
+        
+        self.schedule_change(PendingChange {
+            network_id: String::new(),
+            network_name: String::new(),
+            tunnel_name: None,
+            action,
+        });
+        
+        // Show immediate feedback
+        self.status_message = Some(format!(
+            "Kill switch → {} ({}s)",
+            if new_state { "ON" } else { "OFF" },
+            COUNTDOWN_SECONDS
+        ));
+        
+        Ok(())
+    }
+
+
+    pub async fn tick(&mut self) -> Result<()> {
+        // Handle pending change countdown
+        if let Some(start) = self.countdown_start {
+            let elapsed = start.elapsed().as_secs();
+            let remaining = COUNTDOWN_SECONDS.saturating_sub(elapsed);
+            self.countdown_seconds = remaining as u8;
+
+            if remaining == 0 {
+                // Time's up - apply the pending change
+                self.apply_pending_change().await?;
+            }
+        }
+
+        // Refresh VPN status for live traffic stats (every 1 second to avoid too many sudo calls)
+        if self.last_status_refresh.elapsed().as_millis() >= 1000 {
+            self.vpn_status = crate::vpn::wireguard::get_status().await.unwrap_or_default();
+            self.last_status_refresh = Instant::now();
+        }
+        
+        // Periodic connectivity check (every 10 seconds)
+        if self.last_connectivity_check.elapsed().as_secs() >= 10 {
+            self.connectivity = crate::network::check_connectivity().await;
+            self.last_connectivity_check = Instant::now();
+        }
+        
+        // Periodic VPN health check (every 30 seconds when connected)
+        if self.vpn_status.connected && self.last_health_check.elapsed().as_secs() >= 30 {
+            self.vpn_health = crate::vpn::wireguard::health_check().await;
+            self.last_health_check = Instant::now();
+        }
+
+        // Update info message with VPN traffic stats if connected
+        if self.pending_change.is_none() {
+            self.update_info_message();
+        }
+
+        Ok(())
+    }
+
+    /// Parse transfer string like "1.23 GiB" to bytes
+    fn parse_transfer_to_bytes(s: &str) -> u64 {
+        let parts: Vec<&str> = s.trim().split_whitespace().collect();
+        if parts.len() != 2 {
+            return 0;
+        }
+        
+        let value: f64 = parts[0].parse().unwrap_or(0.0);
+        let unit = parts[1].to_lowercase();
+        
+        let multiplier: u64 = match unit.as_str() {
+            "b" => 1,
+            "kib" => 1024,
+            "mib" => 1024 * 1024,
+            "gib" => 1024 * 1024 * 1024,
+            "tib" => 1024 * 1024 * 1024 * 1024,
+            // Also handle SI units
+            "kb" => 1000,
+            "mb" => 1000 * 1000,
+            "gb" => 1000 * 1000 * 1000,
+            "tb" => 1000 * 1000 * 1000 * 1000,
+            _ => 1,
+        };
+        
+        (value * multiplier as f64) as u64
+    }
+
+    /// Format bytes to human-readable string
+    fn format_bytes(bytes: u64) -> String {
+        const KIB: u64 = 1024;
+        const MIB: u64 = KIB * 1024;
+        const GIB: u64 = MIB * 1024;
+        const TIB: u64 = GIB * 1024;
+        
+        if bytes >= TIB {
+            format!("{:.2} TiB", bytes as f64 / TIB as f64)
+        } else if bytes >= GIB {
+            format!("{:.2} GiB", bytes as f64 / GIB as f64)
+        } else if bytes >= MIB {
+            format!("{:.2} MiB", bytes as f64 / MIB as f64)
+        } else if bytes >= KIB {
+            format!("{:.2} KiB", bytes as f64 / KIB as f64)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
+    /// Format duration to human-readable string
+    fn format_duration(secs: u64) -> String {
+        if secs < 60 {
+            format!("{}s", secs)
+        } else if secs < 3600 {
+            let mins = secs / 60;
+            let secs = secs % 60;
+            if secs == 0 {
+                format!("{}m", mins)
+            } else {
+                format!("{}m {}s", mins, secs)
+            }
+        } else {
+            let hours = secs / 3600;
+            let mins = (secs % 3600) / 60;
+            if mins == 0 {
+                format!("{}h", hours)
+            } else {
+                format!("{}h {}m", hours, mins)
+            }
+        }
+    }
+
+    /// Update the info message with current status/traffic
+    fn update_info_message(&mut self) {
+        if self.vpn_status.connected {
+            let current_iface = self.vpn_status.interface.clone();
+            
+            // Check if interface changed - reset session tracking
+            if self.session_interface != current_iface {
+                self.session_interface = current_iface.clone();
+                self.session_start = Instant::now();
+                
+                // Set baseline from current transfer values
+                if let Some(ref rx) = self.vpn_status.transfer_rx {
+                    self.session_baseline_rx = Self::parse_transfer_to_bytes(rx);
+                }
+                if let Some(ref tx) = self.vpn_status.transfer_tx {
+                    self.session_baseline_tx = Self::parse_transfer_to_bytes(tx);
+                }
+            }
+            
+            let mut parts = Vec::new();
+            
+            // VPN health indicator
+            let health_icon = if self.vpn_health.is_healthy() {
+                "󰒘" // Connected and healthy
+            } else if self.vpn_health.is_degraded() {
+                "󰒙" // Connected but degraded
+            } else {
+                "󰒍" // Connected but issues
+            };
+            
+            // Interface name with health indicator
+            if let Some(ref iface) = self.vpn_status.interface {
+                parts.push(format!("{} {}", health_icon, iface));
+            }
+            
+            // Session duration
+            let session_secs = self.session_start.elapsed().as_secs();
+            parts.push(format!("󰔟 {}", Self::format_duration(session_secs)));
+            
+            // Session traffic (current - baseline)
+            if let (Some(ref rx), Some(ref tx)) = (&self.vpn_status.transfer_rx, &self.vpn_status.transfer_tx) {
+                let current_rx = Self::parse_transfer_to_bytes(rx);
+                let current_tx = Self::parse_transfer_to_bytes(tx);
+                
+                let session_rx = current_rx.saturating_sub(self.session_baseline_rx);
+                let session_tx = current_tx.saturating_sub(self.session_baseline_tx);
+                
+                parts.push(format!("↓{} ↑{}", 
+                    Self::format_bytes(session_rx), 
+                    Self::format_bytes(session_tx)
+                ));
+            }
+            
+            // Status warnings (more detailed)
+            if !self.vpn_status.routing_ok {
+                parts.push("⚠ no route".to_string());
+            } else if self.vpn_status.handshake_stale {
+                parts.push("⏳ stale".to_string());
+            } else if !self.vpn_health.can_reach_internet && self.vpn_health.interface_exists {
+                parts.push("⚠ no internet".to_string());
+            }
+            
+            self.info_message = if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" │ "))
+            };
+        } else {
+            // Reset session tracking when disconnected
+            if self.session_interface.is_some() {
+                self.session_interface = None;
+                self.session_baseline_rx = 0;
+                self.session_baseline_tx = 0;
+            }
+            
+            // Show network connectivity status
+            if !self.connectivity.has_interface {
+                self.info_message = Some("󰤭 No network".to_string());
+            } else if !self.connectivity.has_ip_address {
+                self.info_message = Some("󰤫 No IP address".to_string());
+            } else if !self.connectivity.has_internet {
+                if self.connectivity.can_reach_gateway {
+                    self.info_message = Some("󰤩 No internet (captive portal?)".to_string());
+                } else {
+                    self.info_message = Some("󰤩 No internet".to_string());
+                }
+            } else if let Some(network) = self.networks.iter().find(|n| n.connected) {
+                // Online but no VPN
+                self.info_message = Some(format!("󰖩 {} (no VPN)", network.name));
+            } else {
+                self.info_message = Some("󰖩 Online (no VPN)".to_string());
+            }
+        }
+    }
+
+    /// Apply the pending configuration change
+    async fn apply_pending_change(&mut self) -> Result<()> {
+        if let Some(change) = self.pending_change.take() {
+            self.countdown_start = None;
+            self.countdown_seconds = 0;
+
+            match change.action {
+                PendingAction::Connect => {
+                    if let Some(tunnel) = &change.tunnel_name {
+                        self.status_message = Some(format!("Connecting to {}...", tunnel));
+                        match crate::vpn::wireguard::connect(tunnel).await {
+                            Ok(_) => {
+                                self.status_message = Some(format!("Connected to {}", tunnel));
+                            }
+                            Err(e) => {
+                                self.status_message = Some(format!("Error: {}", e));
+                            }
+                        }
+                    }
+                }
+                PendingAction::Disconnect => {
+                    self.status_message = Some("Disconnecting...".to_string());
+                    match crate::vpn::wireguard::disconnect().await {
+                        Ok(_) => {
+                            self.status_message = Some("Disconnected".to_string());
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("Error: {}", e));
+                        }
+                    }
+                }
+                PendingAction::Reconnect => {
+                    if let Some(tunnel) = &change.tunnel_name {
+                        self.status_message = Some(format!("Switching to {}...", tunnel));
+                        let _ = crate::vpn::wireguard::disconnect().await;
+                        match crate::vpn::wireguard::connect(tunnel).await {
+                            Ok(_) => {
+                                self.status_message = Some(format!("Connected to {}", tunnel));
+                            }
+                            Err(e) => {
+                                self.status_message = Some(format!("Error: {}", e));
+                            }
+                        }
+                    }
+                }
+                PendingAction::KillSwitchOn => {
+                    self.status_message = Some("Enabling kill switch...".to_string());
+                    match crate::vpn::killswitch::enable().await {
+                        Ok(_) => {
+                            self.kill_switch_enabled = true;
+                            self.config.kill_switch = true;
+                            let _ = self.config.save();
+                            self.status_message = Some("Kill switch enabled".to_string());
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("Error: {}", e));
+                        }
+                    }
+                }
+                PendingAction::KillSwitchOff => {
+                    self.status_message = Some("Disabling kill switch...".to_string());
+                    match crate::vpn::killswitch::disable().await {
+                        Ok(_) => {
+                            self.kill_switch_enabled = false;
+                            self.config.kill_switch = false;
+                            let _ = self.config.save();
+                            self.status_message = Some("Kill switch disabled".to_string());
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("Error: {}", e));
+                        }
+                    }
+                }
+            }
+
+            // Refresh status
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    /// Schedule a pending change with countdown (resets if already pending)
+    fn schedule_change(&mut self, change: PendingChange) {
+        self.pending_change = Some(change);
+        self.countdown_start = Some(Instant::now());
+        self.countdown_seconds = COUNTDOWN_SECONDS as u8;
+    }
+
+    /// Cancel any pending change
+    pub fn cancel_pending_change(&mut self) {
+        self.pending_change = None;
+        self.countdown_start = None;
+        self.countdown_seconds = 0;
+    }
+
+    /// Get the rule for a specific network
+    pub fn get_network_rule(&self, network: &NetworkInfo) -> Option<&NetworkRule> {
+        self.network_rules.iter().find(|r| r.identifier == network.identifier())
+    }
+}

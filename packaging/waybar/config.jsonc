@@ -1,0 +1,45 @@
+// Waybar module configuration for tonneru
+// Add this module to your ~/.config/waybar/config
+
+// OPTION 1: Direct tonneru integration (recommended)
+// Add "custom/vpn" to your modules-right array
+// Uses filled/outline icons (Omarchy convention) - no color changes
+{
+    "custom/vpn": {
+        "exec": "tonneru --status 2>/dev/null",
+        "return-type": "json",
+        "interval": 3,
+        "on-click": "ghostty --title='tonneru' -e tonneru",
+        "on-click-right": "tonneru --disconnect",
+        "format": "{icon}",
+        "format-icons": {
+            "connected": "󰒡",
+            "disconnected": "󰒖"
+        },
+        "tooltip": true,
+        "exec-if": "which tonneru"
+    }
+}
+
+// OPTION 2: With tunnel name displayed
+// {
+//     "custom/vpn": {
+//         "exec": "~/.config/waybar/scripts/tonneru-status.sh",
+//         "return-type": "json",
+//         "interval": 3,
+//         "on-click": "kitty --title 'tonneru' tonneru",
+//         "on-click-right": "tonneru --disconnect",
+//         "tooltip": true,
+//         "exec-if": "which tonneru"
+//     }
+// }
+
+// OPTION 3: Minimal icon only
+// {
+//     "custom/vpn": {
+//         "exec": "tonneru --status 2>/dev/null | jq -r 'if .connected then \"󰒘\" else \"󰒙\" end'",
+//         "interval": 5,
+//         "on-click": "kitty --title 'tonneru' tonneru",
+//         "tooltip": false
+//     }
+// }
