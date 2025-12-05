@@ -34,16 +34,13 @@ fn header() -> Color { theme().header }
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     
-    // Only show header if kill switch is enabled
-    let header_height = if app.kill_switch_enabled { 1 } else { 0 };
-    
-    // Responsive layout based on terminal height (no settings box)
-    // Networks and Tunnels boxes always get equal height (50/50 split of remaining space)
+    // Responsive layout based on terminal height
+    // Networks, Tunnels, and Kill Switch boxes
     let (networks_height, tunnels_height) = if area.height < 25 {
         // Small terminal - use minimum heights
         (Constraint::Min(4), Constraint::Min(4))
     } else {
-        // Equal split for both boxes
+        // Equal split for both boxes (minus kill switch box height)
         (Constraint::Ratio(1, 2), Constraint::Ratio(1, 2))
     };
 
@@ -51,20 +48,18 @@ pub fn draw(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .margin(0)
         .constraints([
-            Constraint::Length(header_height),  // Header (only if kill switch on)
             Constraint::Length(1),               // Info line
             networks_height,                     // Networks box
             tunnels_height,                      // Tunnels box
+            Constraint::Length(3),               // Kill Switch box (one-liner with border)
             Constraint::Length(1),               // Footer
         ])
         .split(area);
 
-    if app.kill_switch_enabled {
-        draw_header(f, app, chunks[0]);
-    }
-    draw_info_line(f, app, chunks[1]);
-    draw_networks_box(f, app, chunks[2]);
-    draw_tunnels_box(f, app, chunks[3]);
+    draw_info_line(f, app, chunks[0]);
+    draw_networks_box(f, app, chunks[1]);
+    draw_tunnels_box(f, app, chunks[2]);
+    draw_killswitch_box(f, app, chunks[3]);
     draw_footer(f, app, chunks[4]);
 
     // Draw popups on top
@@ -77,26 +72,55 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let kill_switch = if app.kill_switch_enabled {
-        Span::styled(" 󰯄 KILL SWITCH ENABLED ", Style::default().fg(danger()))
+fn draw_killswitch_box(f: &mut Frame, app: &App, area: Rect) {
+    let is_active = app.section == Section::KillSwitch;
+    let border_color = if is_active { accent() } else { inactive() };
+    let title_style = if is_active {
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD)
     } else {
-        Span::raw("")
+        Style::default().fg(inactive())
     };
 
-    // Only show header if kill switch is on or there's a status message
-    let header = if app.kill_switch_enabled {
-        Paragraph::new(Line::from(vec![kill_switch]))
-            .alignment(Alignment::Center)
+    let block = Block::default()
+        .title(Span::styled(" Internet (k)ill Switch ", title_style))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+
+    // Kill switch status
+    let (status_icon, status_text, status_color) = if app.kill_switch_enabled {
+        ("󰯄", "ENABLED - All traffic blocked except VPN", danger())
     } else {
-        Paragraph::new("")
+        ("󰒙", "Disabled - Traffic allowed without VPN", text_dim())
     };
 
-    f.render_widget(header, area);
+    // Action hint
+    let action_hint = if is_active {
+        vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(status_icon, Style::default().fg(status_color)),
+            Span::styled(format!(" {} ", status_text), Style::default().fg(status_color)),
+            Span::styled("│ ", Style::default().fg(inactive())),
+            Span::styled("Space", Style::default().fg(accent())),
+            Span::styled("/", Style::default().fg(inactive())),
+            Span::styled("k", Style::default().fg(accent())),
+            Span::styled(" toggle", Style::default().fg(text_dim())),
+        ]
+    } else {
+        vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(status_icon, Style::default().fg(status_color)),
+            Span::styled(format!(" {}", status_text), Style::default().fg(status_color)),
+        ]
+    };
+
+    let content = Paragraph::new(Line::from(action_hint))
+        .block(block);
+
+    f.render_widget(content, area);
 }
 
 fn draw_info_line(f: &mut Frame, app: &App, area: Rect) {
-    // Priority: pending change countdown > info message
+    // Priority: pending change countdown > status message > info message > ready
     let line = if let Some(ref pending) = app.pending_change {
         // Show countdown with action description
         let action_text = match pending.action {
@@ -121,7 +145,12 @@ fn draw_info_line(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" │ ", Style::default().fg(text_dim())),
             Span::styled(action_text, Style::default().fg(text())),
             Span::styled(" │ ", Style::default().fg(text_dim())),
-            Span::styled("(change resets timer)", Style::default().fg(text_dim())),
+            Span::styled("(Esc cancels)", Style::default().fg(text_dim())),
+        ])
+    } else if let Some(ref status) = app.status_message {
+        // Show status/action feedback (e.g., "Connected to wg0", "Config saved")
+        Line::from(vec![
+            Span::styled(status, Style::default().fg(warning())),
         ])
     } else if let Some(ref info) = app.info_message {
         // Show VPN status/traffic info
@@ -290,13 +319,6 @@ fn draw_tunnels_list(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
 
-    // Kill switch display
-    let (kill_text, kill_color) = if app.kill_switch_enabled {
-        ("On", success())
-    } else {
-        ("Off", text_dim())
-    };
-
     // Show different columns based on whether config is expanded
     let header = if app.show_config {
         Row::new(vec![
@@ -309,7 +331,6 @@ fn draw_tunnels_list(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("", Style::default().fg(header())),
             Span::styled("Name", Style::default().fg(header())),
             Span::styled("Status", Style::default().fg(header())),
-            Span::styled("(k)ill", Style::default().fg(header())),
             Span::styled("(c)onfig", Style::default().fg(header())),
         ])
     };
@@ -362,12 +383,11 @@ fn draw_tunnels_list(f: &mut Frame, app: &App, area: Rect) {
                     ])
                     .style(row_style)
                 } else {
-                    // Full view with kill switch and config columns
+                    // Full view with config column
                     Row::new(vec![
                         Span::styled(icon, Style::default().fg(icon_color)),
                         Span::styled(&tunnel.name, Style::default().fg(text())),
                         Span::styled(status, Style::default().fg(status_color)),
-                        Span::styled(kill_text, Style::default().fg(kill_color)),
                         Span::styled("▸", Style::default().fg(accent())),  // Indicator to expand
                     ])
                     .style(row_style)
@@ -385,10 +405,9 @@ fn draw_tunnels_list(f: &mut Frame, app: &App, area: Rect) {
     } else {
         vec![
             Constraint::Length(3),
+            Constraint::Percentage(45),
             Constraint::Percentage(35),
-            Constraint::Percentage(18),
             Constraint::Percentage(15),
-            Constraint::Percentage(27),
         ]
     };
 
@@ -509,18 +528,24 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Section::Networks => vec![
             ("↑↓", "Nav"),
             ("r", "Rule"),
-            ("k", "Kill"),
             ("t", "Tunnel"),
             ("d", "Del"),
             ("Tab", "Next"),
+            ("h", "Help"),
         ],
         Section::Tunnels => vec![
             ("↑↓", "Nav"),
             ("Space", "Connect"),
-            ("k", "Kill"),
             ("c", "Config"),
             ("f", "Import"),
             ("d", "Del"),
+            ("h", "Help"),
+        ],
+        Section::KillSwitch => vec![
+            ("Space", "Toggle"),
+            ("k", "Toggle"),
+            ("Tab", "Next"),
+            ("h", "Help"),
         ],
     };
 
@@ -538,12 +563,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let mut line_spans = hint_spans;
-    if let Some(msg) = &app.status_message {
-        line_spans.push(Span::styled(msg, Style::default().fg(warning())));
-    }
-
-    let footer = Paragraph::new(Line::from(line_spans))
+    // Footer is commands legend ONLY - no status messages here
+    let footer = Paragraph::new(Line::from(hint_spans))
         .alignment(Alignment::Center);
 
     f.render_widget(footer, area);
@@ -736,69 +757,113 @@ fn draw_config_preview(f: &mut Frame, app: &App) {
 fn draw_help_popup(f: &mut Frame) {
     let area = f.area();
     let popup_area = centered_rect(
-        if area.width < 70 { 90 } else { 55 },
-        if area.height < 35 { 90 } else { 80 },
+        if area.width < 80 { 95 } else { 70 },
+        if area.height < 40 { 95 } else { 85 },
         area
     );
 
     f.render_widget(Clear, popup_area);
 
     let help_text = vec![
-        Line::from(Span::styled("Navigation", Style::default().fg(header()))),
+        Line::from(Span::styled("═══ Navigation ═══", Style::default().fg(header()).add_modifier(Modifier::BOLD))),
         Line::from(vec![
-            Span::styled("  Tab", Style::default().fg(accent())),
-            Span::raw("              Switch sections"),
+            Span::styled("  Tab       ", Style::default().fg(accent())),
+            Span::raw("Switch sections (Networks → Tunnels → Kill Switch)"),
         ]),
         Line::from(vec![
-            Span::styled("  j/k", Style::default().fg(accent())),
-            Span::raw("              Move up/down"),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("Tunnel Actions", Style::default().fg(header()))),
-        Line::from(vec![
-            Span::styled("  Space/Enter", Style::default().fg(accent())),
-            Span::raw("      Connect/Disconnect"),
-        ]),
-        Line::from(vec![
-            Span::styled("  f", Style::default().fg(accent())),
-            Span::raw("              Import .conf file"),
-        ]),
-        Line::from(vec![
-            Span::styled("  d", Style::default().fg(accent())),
-            Span::raw("              Delete tunnel"),
+            Span::styled("  ↑/↓ j/k   ", Style::default().fg(accent())),
+            Span::raw("Move up/down in lists"),
         ]),
         Line::from(""),
-        Line::from(Span::styled("Network Rules", Style::default().fg(header()))),
+        Line::from(Span::styled("═══ Tunnel Actions ═══", Style::default().fg(header()).add_modifier(Modifier::BOLD))),
         Line::from(vec![
-            Span::styled("  r", Style::default().fg(accent())),
-            Span::raw("              Cycle rule (Always/Never)"),
+            Span::styled("  Space     ", Style::default().fg(accent())),
+            Span::raw("Connect/Disconnect selected tunnel"),
         ]),
         Line::from(vec![
-            Span::styled("  t", Style::default().fg(accent())),
-            Span::raw("              Cycle tunnel selection"),
+            Span::styled("  f         ", Style::default().fg(accent())),
+            Span::raw("Import .conf file from file browser"),
+        ]),
+        Line::from(vec![
+            Span::styled("  c         ", Style::default().fg(accent())),
+            Span::raw("View/edit tunnel config"),
+        ]),
+        Line::from(vec![
+            Span::styled("  d         ", Style::default().fg(accent())),
+            Span::raw("Delete selected tunnel"),
         ]),
         Line::from(""),
-        Line::from(Span::styled("Settings", Style::default().fg(header()))),
+        Line::from(Span::styled("═══ Network Rules ═══", Style::default().fg(header()).add_modifier(Modifier::BOLD))),
         Line::from(vec![
-            Span::styled("  K", Style::default().fg(accent())),
-            Span::raw("              Kill switch"),
+            Span::styled("  r         ", Style::default().fg(accent())),
+            Span::raw("Cycle rule: Always → Never → Session → None"),
+        ]),
+        Line::from(vec![
+            Span::styled("  t         ", Style::default().fg(accent())),
+            Span::raw("Cycle tunnel assignment for network"),
         ]),
         Line::from(""),
-        Line::from(Span::styled("General", Style::default().fg(header()))),
+        Line::from(Span::styled("═══ Kill Switch ═══", Style::default().fg(header()).add_modifier(Modifier::BOLD))),
         Line::from(vec![
-            Span::styled("  ?", Style::default().fg(accent())),
-            Span::raw("              This help"),
+            Span::styled("  k/Space   ", Style::default().fg(accent())),
+            Span::raw("Toggle kill switch (when box is active)"),
         ]),
         Line::from(vec![
-            Span::styled("  q", Style::default().fg(accent())),
-            Span::raw("              Quit"),
+            Span::raw("            Blocks all traffic except through VPN"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("═══ Quick Start ═══", Style::default().fg(header()).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::styled("  tonneru              ", Style::default().fg(accent())),
+            Span::raw("Launch this TUI"),
+        ]),
+        Line::from(vec![
+            Span::styled("  tonneru --daemon     ", Style::default().fg(accent())),
+            Span::raw("Run as background daemon"),
+        ]),
+        Line::from(vec![
+            Span::styled("  tonneru --status     ", Style::default().fg(accent())),
+            Span::raw("Get JSON status for scripts"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("═══ Service Management ═══", Style::default().fg(header()).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::styled("  systemctl --user status tonneru   ", Style::default().fg(text_dim())),
+        ]),
+        Line::from(vec![
+            Span::styled("  systemctl --user restart tonneru  ", Style::default().fg(text_dim())),
+        ]),
+        Line::from(vec![
+            Span::styled("  journalctl --user -u tonneru -f   ", Style::default().fg(text_dim())),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("═══ Security ═══", Style::default().fg(header()).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::raw("  • Uses dedicated 'tonneru' group (not wheel)"),
+        ]),
+        Line::from(vec![
+            Span::raw("  • Single auditable helper script for privileged ops"),
+        ]),
+        Line::from(vec![
+            Span::styled("  • Logs: ", Style::default()),
+            Span::styled("journalctl -t tonneru-sudo", Style::default().fg(text_dim())),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Press ", Style::default().fg(text_dim())),
+            Span::styled("h", Style::default().fg(accent())),
+            Span::styled("/", Style::default().fg(text_dim())),
+            Span::styled("?", Style::default().fg(accent())),
+            Span::styled("/", Style::default().fg(text_dim())),
+            Span::styled("Esc", Style::default().fg(accent())),
+            Span::styled(" to close", Style::default().fg(text_dim())),
         ]),
     ];
 
     let help = Paragraph::new(help_text)
         .block(
             Block::default()
-                .title(Span::styled(" 󰋖 Help ", Style::default().fg(accent())))
+                .title(Span::styled(" 󰋖 tonneru Help ", Style::default().fg(accent())))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(accent())),
         )
@@ -855,3 +920,4 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         ])
         .split(popup_layout[1])[1]
 }
+

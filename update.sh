@@ -17,6 +17,21 @@ echo "║                    tonneru update                            ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
+# Check for required dependencies
+echo "󰖂 Checking dependencies..."
+
+# Check for wireguard-tools
+if ! command -v wg &> /dev/null; then
+    echo "󰖂 Installing wireguard-tools..."
+    sudo pacman -S --noconfirm wireguard-tools
+fi
+
+# Check for nftables (required for kill switch)
+if ! command -v nft &> /dev/null; then
+    echo "󰖂 Installing nftables..."
+    sudo pacman -S --noconfirm nftables
+fi
+
 # Build (unless quick mode and binary exists)
 if [[ "$QUICK_MODE" != "quick" ]] || [[ ! -f "target/release/tonneru" ]]; then
     echo "󰖂 Building..."

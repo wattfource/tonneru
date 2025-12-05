@@ -34,6 +34,7 @@ pub enum Section {
     Networks,
     Tunnels,
     TunnelConfig,  // Config editor panel
+    KillSwitch,    // Internet kill switch box
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +71,9 @@ pub struct App {
     pub preview_name: String,
     pub preview_field: usize,  // 0 = name, 1 = save/cancel buttons
 
-    // Status message
+    // Status message (shown in info line, auto-clears after timeout)
     pub status_message: Option<String>,
+    pub status_message_time: Option<Instant>,
 
     // Kill switch
     pub kill_switch_enabled: bool,
@@ -111,6 +113,10 @@ pub struct App {
     pub last_connectivity_check: Instant, // When we last checked connectivity
     pub vpn_health: VpnHealthCheck,       // Detailed VPN health status
     pub last_health_check: Instant,       // When we last did a full health check
+    
+    // Public IP tracking
+    pub public_ip: Option<String>,        // Current public IP address
+    pub ip_fetch_pending: bool,           // Whether we're waiting to fetch IP
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +158,7 @@ impl App {
             preview_field: 0,
 
             status_message: None,
+            status_message_time: None,
             kill_switch_enabled: false,
 
             browser_path: dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
@@ -180,10 +187,17 @@ impl App {
             last_connectivity_check: Instant::now(),
             vpn_health,
             last_health_check: Instant::now(),
+            
+            public_ip: None,
+            ip_fetch_pending: false,
         };
 
+        // Check if kill switch is already enabled (from previous session)
+        if crate::vpn::killswitch::is_enabled().await.unwrap_or(false) {
+            app.kill_switch_enabled = true;
+            tracing::info!("Kill switch already enabled from previous session");
+        } else if app.vpn_status.connected {
         // If connected to a tunnel, restore its kill switch setting
-        if app.vpn_status.connected {
             if let Some(iface) = &app.vpn_status.interface {
                 let tunnel_ks = app.get_tunnel_info(iface)
                     .map(|t| t.kill_switch)
@@ -200,6 +214,12 @@ impl App {
         Ok(app)
     }
 
+    /// Set a status message (auto-clears after 3 seconds)
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.status_message_time = Some(Instant::now());
+    }
+    
     /// Get TunnelInfo for a tunnel by name
     fn get_tunnel_info(&self, name: &str) -> Option<&TunnelInfo> {
         self.config.known_tunnels.iter().find(|t| t.name == name)
@@ -265,7 +285,7 @@ impl App {
             // Disconnect first if connected
             if was_connected {
                 let _ = crate::vpn::wireguard::disconnect().await;
-                self.status_message = Some(format!("Disconnecting {} to apply changes...", tunnel_name));
+                self.set_status(format!("Disconnecting {} to apply changes...", tunnel_name));
             }
 
             // Save using the add_profile function (handles sudo)
@@ -278,20 +298,20 @@ impl App {
                     if was_connected {
                         match crate::vpn::wireguard::connect(&tunnel_name).await {
                             Ok(_) => {
-                                self.status_message = Some(format!("Config saved & {} reconnected", tunnel_name));
+                                self.set_status(format!("Config saved & {} reconnected", tunnel_name));
                             }
                             Err(e) => {
-                                self.status_message = Some(format!("Saved but reconnect failed: {}", e));
+                                self.set_status(format!("Saved but reconnect failed: {}", e));
                             }
                         }
                     } else {
-                        self.status_message = Some(format!("Config saved for {}", tunnel_name));
+                        self.set_status(format!("Config saved for {}", tunnel_name));
                     }
                     
                     self.refresh().await?;
                 }
                 Err(e) => {
-                    self.status_message = Some(format!("Save failed: {}", e));
+                    self.set_status(format!("Save failed: {}", e));
                 }
             }
         }
@@ -317,27 +337,29 @@ impl App {
         // Escape cancels pending change
         if key.code == KeyCode::Esc && self.pending_change.is_some() {
             self.cancel_pending_change();
-            self.status_message = Some("Change cancelled".to_string());
+            self.set_status("Change cancelled");
             return Ok(());
         }
 
         match key.code {
-            // Navigation between sections (Networks ↔ Tunnels)
+            // Navigation between sections (Networks ↔ Tunnels ↔ KillSwitch)
             KeyCode::Tab => {
                 self.section = match self.section {
                     Section::Networks => Section::Tunnels,
-                    Section::Tunnels => Section::Networks,
+                    Section::Tunnels => Section::KillSwitch,
+                    Section::KillSwitch => Section::Networks,
                     Section::TunnelConfig => {
                         // Collapse config when tabbing out
                         self.show_config = false;
-                        Section::Networks
+                        Section::KillSwitch
                     }
                 };
             }
             KeyCode::BackTab => {
                 self.section = match self.section {
-                    Section::Networks => Section::Tunnels,
+                    Section::Networks => Section::KillSwitch,
                     Section::Tunnels => Section::Networks,
+                    Section::KillSwitch => Section::Tunnels,
                     Section::TunnelConfig => {
                         // Collapse config when tabbing out
                         self.show_config = false;
@@ -352,8 +374,17 @@ impl App {
 
             // Actions based on section
             KeyCode::Char(' ') | KeyCode::Enter => {
+                match self.section {
+                    Section::Tunnels => {
                 // Space/Enter = connect/use tunnel now
                 self.use_tunnel_now().await?;
+                    }
+                    Section::KillSwitch => {
+                        // Space/Enter = toggle kill switch
+                        self.toggle_kill_switch().await?;
+                    }
+                    _ => {}
+                }
             }
 
             // Expand config panel (only in Tunnels section)
@@ -382,16 +413,15 @@ impl App {
             // Cycle through tunnels for selected network
             KeyCode::Char('t') => self.cycle_network_tunnel().await?,
             
-            // Kill switch
-            // Kill switch toggle (in Tunnels section)
+            // Kill switch toggle (only when KillSwitch section is active)
             KeyCode::Char('k') => {
-                if self.section == Section::Tunnels {
+                if self.section == Section::KillSwitch {
                     self.toggle_kill_switch().await?;
                 }
             }
             
-            // Help
-            KeyCode::Char('?') => self.popup = Popup::Help,
+            // Help (? or h)
+            KeyCode::Char('?') | KeyCode::Char('h') => self.popup = Popup::Help,
 
             _ => {}
         }
@@ -422,7 +452,7 @@ impl App {
                     // Reload original
                     self.tunnel_config_content = self.tunnel_config_original.clone();
                     self.tunnel_config_modified = false;
-                    self.status_message = Some("Changes discarded".to_string());
+                    self.set_status("Changes discarded");
                 }
                 self.show_config = false;
                 self.section = Section::Tunnels;
@@ -471,7 +501,7 @@ impl App {
             Popup::FileBrowser => self.handle_browser_key(key).await,
             Popup::ConfigPreview => self.handle_preview_key(key).await,
             Popup::Help => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q')) {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Enter | KeyCode::Char('q')) {
                     self.popup = Popup::None;
                 }
                 Ok(())
@@ -517,6 +547,9 @@ impl App {
                     self.tunnel_config_scroll += 1;
                 }
             }
+            Section::KillSwitch => {
+                // No navigation in kill switch box (it's a single toggle)
+            }
         }
     }
 
@@ -543,6 +576,9 @@ impl App {
                     self.tunnel_config_scroll -= 1;
                 }
             }
+            Section::KillSwitch => {
+                // No navigation in kill switch box (it's a single toggle)
+            }
         }
     }
 
@@ -562,7 +598,7 @@ impl App {
                     self.kill_switch_enabled = false;
                 }
                 crate::vpn::wireguard::disconnect().await?;
-                self.status_message = Some("Disconnected".to_string());
+                self.set_status("Disconnected");
             } else {
                 // Disconnect any existing first (and their kill switch)
                 if self.vpn_status.connected {
@@ -581,12 +617,12 @@ impl App {
                 if tunnel_ks {
                     if let Ok(_) = crate::vpn::killswitch::enable().await {
                         self.kill_switch_enabled = true;
-                        self.status_message = Some(format!("Connected to {} (kill switch on)", tunnel_name));
+                        self.set_status(format!("Connected to {} (kill switch on)", tunnel_name));
                     } else {
-                        self.status_message = Some(format!("Connected to {}", tunnel_name));
+                        self.set_status(format!("Connected to {}", tunnel_name));
                     }
                 } else {
-                    self.status_message = Some(format!("Connected to {}", tunnel_name));
+                    self.set_status(format!("Connected to {}", tunnel_name));
                 }
             }
             self.refresh().await?;
@@ -694,7 +730,7 @@ impl App {
             }
         }
 
-        self.status_message = Some(status_text);
+        self.set_status(status_text);
         Ok(())
     }
 
@@ -713,7 +749,7 @@ impl App {
         };
 
         if self.tunnels.is_empty() {
-            self.status_message = Some("No tunnels. Press 'f' to import.".to_string());
+            self.set_status("No tunnels. Press 'f' to import.");
             return Ok(());
         }
 
@@ -758,7 +794,7 @@ impl App {
         });
 
         let rule_text = if always_vpn { "Always" } else if session_vpn { "Session" } else if never_vpn { "Never" } else { "-" };
-        self.status_message = Some(format!("{}: {} → {}", network.name, rule_text, new_tunnel_name));
+        self.set_status(format!("{}: {} → {}", network.name, rule_text, new_tunnel_name));
 
         self.config.network_rules = self.network_rules.clone();
         self.config.save()?;
@@ -896,11 +932,11 @@ impl App {
                     self.popup = Popup::ConfigPreview;
                     self.preview_field = 0;  // Start on name field
                 } else {
-                    self.status_message = Some("Not a valid WireGuard config".to_string());
+                    self.set_status("Not a valid WireGuard config");
                 }
             }
             Err(e) => {
-                self.status_message = Some(format!("Cannot read: {}", e));
+                self.set_status(format!("Cannot read: {}", e));
             }
         }
         Ok(())
@@ -953,11 +989,11 @@ impl App {
 
         match crate::vpn::wireguard::add_profile(&name, &self.config_preview).await {
             Ok(_) => {
-                self.status_message = Some(format!("Saved tunnel: {}", name));
+                self.set_status(format!("Saved tunnel: {}", name));
                 let _ = self.refresh().await;
             }
             Err(e) => {
-                self.status_message = Some(format!("Failed: {}", e));
+                self.set_status(format!("Failed: {}", e));
                 return Ok(()); // Don't close popup on error
             }
         }
@@ -973,7 +1009,7 @@ impl App {
             Section::Tunnels => {
                 if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
                     self.input_buffer = tunnel.name.clone(); // Store name for confirm
-                    self.status_message = Some(format!("Delete '{}'? (y/n)", tunnel.name));
+                    self.set_status(format!("Delete '{}'? (y/n)", tunnel.name));
                     self.popup = Popup::Confirm;
                 }
             }
@@ -981,7 +1017,7 @@ impl App {
                 // Same as Tunnels - delete the selected tunnel
                 if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
                     self.input_buffer = tunnel.name.clone();
-                    self.status_message = Some(format!("Delete '{}'? (y/n)", tunnel.name));
+                    self.set_status(format!("Delete '{}'? (y/n)", tunnel.name));
                     self.popup = Popup::Confirm;
                 }
             }
@@ -992,8 +1028,11 @@ impl App {
                     self.network_rules.retain(|r| r.identifier != identifier);
                     self.config.network_rules = self.network_rules.clone();
                     self.config.save()?;
-                    self.status_message = Some(format!("Rule removed for {}", network.name));
+                    self.set_status(format!("Rule removed for {}", network.name));
                 }
+            }
+            Section::KillSwitch => {
+                // No delete action for kill switch
             }
         }
         Ok(())
@@ -1020,7 +1059,7 @@ impl App {
                 self.config.save()?;
                 
                 self.refresh().await?;
-                self.status_message = Some(format!("Deleted '{}'", tunnel_name));
+                self.set_status(format!("Deleted '{}'", tunnel_name));
                 
                 // Adjust selection if needed
                 if self.selected_tunnel >= self.tunnels.len() && !self.tunnels.is_empty() {
@@ -1028,7 +1067,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.status_message = Some(format!("Delete failed: {}", e));
+                self.set_status(format!("Delete failed: {}", e));
             }
         }
         Ok(())
@@ -1060,7 +1099,7 @@ impl App {
         });
         
         // Show immediate feedback
-        self.status_message = Some(format!(
+        self.set_status(format!(
             "Kill switch → {} ({}s)",
             if new_state { "ON" } else { "OFF" },
             COUNTDOWN_SECONDS
@@ -1082,21 +1121,52 @@ impl App {
                 self.apply_pending_change().await?;
             }
         }
+        
+        // Clear status message after 3 seconds
+        if let Some(time) = self.status_message_time {
+            if time.elapsed().as_secs() >= 3 {
+                self.status_message = None;
+                self.status_message_time = None;
+            }
+        }
 
         // Refresh VPN status for live traffic stats (every 1 second to avoid too many sudo calls)
         if self.last_status_refresh.elapsed().as_millis() >= 1000 {
+            let was_connected = self.vpn_status.connected;
             self.vpn_status = crate::vpn::wireguard::get_status().await.unwrap_or_default();
             self.last_status_refresh = Instant::now();
+            
+            // Trigger IP fetch when VPN just connected
+            if !was_connected && self.vpn_status.connected {
+                self.ip_fetch_pending = true;
+            }
+            
+            // Clear IP when VPN disconnects
+            if was_connected && !self.vpn_status.connected {
+                self.public_ip = None;
+            }
+        }
+        
+        // Fetch public IP if pending (do this after a short delay to allow connection to stabilize)
+        // Skip if kill switch is enabled (traffic is blocked, will timeout)
+        if self.ip_fetch_pending && self.vpn_status.connected && !self.kill_switch_enabled {
+            self.ip_fetch_pending = false;
+            // Spawn IP fetch - don't block the UI
+            if let Some(ip) = crate::network::get_public_ip().await {
+                self.public_ip = Some(ip);
+            }
         }
         
         // Periodic connectivity check (every 10 seconds)
-        if self.last_connectivity_check.elapsed().as_secs() >= 10 {
+        // Skip if kill switch is enabled (we know traffic is blocked except through VPN)
+        if !self.kill_switch_enabled && self.last_connectivity_check.elapsed().as_secs() >= 10 {
             self.connectivity = crate::network::check_connectivity().await;
             self.last_connectivity_check = Instant::now();
         }
         
         // Periodic VPN health check (every 30 seconds when connected)
-        if self.vpn_status.connected && self.last_health_check.elapsed().as_secs() >= 30 {
+        // Skip if kill switch is enabled (health check requires network access)
+        if self.vpn_status.connected && !self.kill_switch_enabled && self.last_health_check.elapsed().as_secs() >= 30 {
             self.vpn_health = crate::vpn::wireguard::health_check().await;
             self.last_health_check = Instant::now();
         }
@@ -1214,6 +1284,11 @@ impl App {
                 parts.push(format!("{} {}", health_icon, iface));
             }
             
+            // Public IP address (if available)
+            if let Some(ref ip) = self.public_ip {
+                parts.push(format!("󰩟 {}", ip));
+            }
+            
             // Session duration
             let session_secs = self.session_start.elapsed().as_secs();
             parts.push(format!("󰔟 {}", Self::format_duration(session_secs)));
@@ -1232,13 +1307,15 @@ impl App {
                 ));
             }
             
-            // Status warnings (more detailed)
+            // Status warnings (more detailed) - skip when kill switch is on (expected behavior)
+            if !self.kill_switch_enabled {
             if !self.vpn_status.routing_ok {
                 parts.push("⚠ no route".to_string());
             } else if self.vpn_status.handshake_stale {
                 parts.push("⏳ stale".to_string());
             } else if !self.vpn_health.can_reach_internet && self.vpn_health.interface_exists {
                 parts.push("⚠ no internet".to_string());
+                }
             }
             
             self.info_message = if parts.is_empty() {
@@ -1283,7 +1360,7 @@ impl App {
             match change.action {
                 PendingAction::Connect => {
                     if let Some(tunnel) = &change.tunnel_name {
-                        self.status_message = Some(format!("Connecting to {}...", tunnel));
+                        self.set_status(format!("Connecting to {}...", tunnel));
                         match crate::vpn::wireguard::connect(tunnel).await {
                             Ok(_) => {
                                 // Apply tunnel's kill switch setting
@@ -1293,22 +1370,22 @@ impl App {
                                 if tunnel_ks {
                                     if let Ok(_) = crate::vpn::killswitch::enable().await {
                                         self.kill_switch_enabled = true;
-                                        self.status_message = Some(format!("Connected to {} (kill switch on)", tunnel));
+                                        self.set_status(format!("Connected to {} (kill switch on)", tunnel));
                                     } else {
-                                        self.status_message = Some(format!("Connected to {}", tunnel));
+                                        self.set_status(format!("Connected to {}", tunnel));
                                     }
                                 } else {
-                                    self.status_message = Some(format!("Connected to {}", tunnel));
+                                    self.set_status(format!("Connected to {}", tunnel));
                                 }
                             }
                             Err(e) => {
-                                self.status_message = Some(format!("Error: {}", e));
+                                self.set_status(format!("Error: {}", e));
                             }
                         }
                     }
                 }
                 PendingAction::Disconnect => {
-                    self.status_message = Some("Disconnecting...".to_string());
+                    self.set_status("Disconnecting...");
                     // Disable kill switch when disconnecting
                     if self.kill_switch_enabled {
                         let _ = crate::vpn::killswitch::disable().await;
@@ -1316,16 +1393,16 @@ impl App {
                     }
                     match crate::vpn::wireguard::disconnect().await {
                         Ok(_) => {
-                            self.status_message = Some("Disconnected".to_string());
+                            self.set_status("Disconnected");
                         }
                         Err(e) => {
-                            self.status_message = Some(format!("Error: {}", e));
+                            self.set_status(format!("Error: {}", e));
                         }
                     }
                 }
                 PendingAction::Reconnect => {
                     if let Some(tunnel) = &change.tunnel_name {
-                        self.status_message = Some(format!("Switching to {}...", tunnel));
+                        self.set_status(format!("Switching to {}...", tunnel));
                         // Disable old kill switch before switching
                         if self.kill_switch_enabled {
                             let _ = crate::vpn::killswitch::disable().await;
@@ -1341,57 +1418,57 @@ impl App {
                                 if tunnel_ks {
                                     if let Ok(_) = crate::vpn::killswitch::enable().await {
                                         self.kill_switch_enabled = true;
-                                        self.status_message = Some(format!("Connected to {} (kill switch on)", tunnel));
+                                        self.set_status(format!("Connected to {} (kill switch on)", tunnel));
                                     } else {
-                                        self.status_message = Some(format!("Connected to {}", tunnel));
+                                        self.set_status(format!("Connected to {}", tunnel));
                                     }
                                 } else {
-                                    self.status_message = Some(format!("Connected to {}", tunnel));
+                                    self.set_status(format!("Connected to {}", tunnel));
                                 }
                             }
                             Err(e) => {
-                                self.status_message = Some(format!("Error: {}", e));
+                                self.set_status(format!("Error: {}", e));
                             }
                         }
                     }
                 }
                 PendingAction::KillSwitchOn => {
-                    self.status_message = Some("Enabling kill switch...".to_string());
+                    self.set_status("Enabling kill switch...");
                     match crate::vpn::killswitch::enable().await {
                         Ok(_) => {
                             self.kill_switch_enabled = true;
                             // Save per-tunnel if connected, otherwise global
                             if let Some(iface) = self.vpn_status.interface.clone() {
                                 self.set_tunnel_kill_switch(&iface, true);
-                                self.status_message = Some(format!("Kill switch enabled for {}", iface));
+                                self.set_status(format!("Kill switch enabled for {}", iface));
                             } else {
                                 self.config.kill_switch = true;
                                 let _ = self.config.save();
-                                self.status_message = Some("Kill switch enabled".to_string());
+                                self.set_status("Kill switch enabled");
                             }
                         }
                         Err(e) => {
-                            self.status_message = Some(format!("Error: {}", e));
+                            self.set_status(format!("Error: {}", e));
                         }
                     }
                 }
                 PendingAction::KillSwitchOff => {
-                    self.status_message = Some("Disabling kill switch...".to_string());
+                    self.set_status("Disabling kill switch...");
                     match crate::vpn::killswitch::disable().await {
                         Ok(_) => {
                             self.kill_switch_enabled = false;
                             // Save per-tunnel if connected, otherwise global
                             if let Some(iface) = self.vpn_status.interface.clone() {
                                 self.set_tunnel_kill_switch(&iface, false);
-                                self.status_message = Some(format!("Kill switch disabled for {}", iface));
+                                self.set_status(format!("Kill switch disabled for {}", iface));
                             } else {
                                 self.config.kill_switch = false;
                                 let _ = self.config.save();
-                                self.status_message = Some("Kill switch disabled".to_string());
+                                self.set_status("Kill switch disabled");
                             }
                         }
                         Err(e) => {
-                            self.status_message = Some(format!("Error: {}", e));
+                            self.set_status(format!("Error: {}", e));
                         }
                     }
                 }

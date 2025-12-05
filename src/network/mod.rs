@@ -672,3 +672,81 @@ pub async fn has_internet() -> bool {
     
     false
 }
+
+/// IP lookup endpoints - randomized to avoid rate limiting and for privacy
+const IP_ENDPOINTS: &[&str] = &[
+    "https://ifconfig.io",
+    "https://api.ipify.org",
+    "https://ipinfo.io/ip",
+    "https://icanhazip.com",
+    "https://ipecho.net/plain",
+    "https://checkip.amazonaws.com",
+    "https://wtfismyip.com/text",
+    "https://api.my-ip.io/ip",
+];
+
+/// Fetch public IP address from a random endpoint
+/// Returns the IP as a string, or None if all attempts fail
+pub async fn get_public_ip() -> Option<String> {
+    use std::process::Command;
+    use std::time::SystemTime;
+    
+    // Simple randomization using system time
+    let seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as usize)
+        .unwrap_or(0);
+    
+    // Shuffle order by starting at random position
+    let start_idx = seed % IP_ENDPOINTS.len();
+    
+    // Try endpoints in pseudo-random order (starting from random position, wrapping around)
+    for i in 0..IP_ENDPOINTS.len() {
+        let idx = (start_idx + i) % IP_ENDPOINTS.len();
+        let endpoint = IP_ENDPOINTS[idx];
+        
+        if let Ok(output) = Command::new("curl")
+            .args([
+                "-4",               // IPv4 only
+                "-s",               // Silent
+                "-f",               // Fail silently on HTTP errors
+                "--connect-timeout", "3",
+                "--max-time", "5",
+                endpoint,
+            ])
+            .output()
+        {
+            if output.status.success() {
+                let ip = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .to_string();
+                
+                // Validate it looks like an IPv4 address
+                if is_valid_ipv4(&ip) {
+                    tracing::debug!("Got public IP {} from {}", ip, endpoint);
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    
+    tracing::warn!("Failed to fetch public IP from all endpoints");
+    None
+}
+
+/// Simple IPv4 validation
+fn is_valid_ipv4(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    
+    for part in parts {
+        match part.parse::<u8>() {
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
+    }
+    
+    true
+}

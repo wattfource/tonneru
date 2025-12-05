@@ -19,6 +19,21 @@ if [ "$EUID" -eq 0 ]; then
     exit 1
 fi
 
+# Check for required dependencies
+echo "Checking dependencies..."
+
+# Check for wireguard-tools
+if ! command -v wg &> /dev/null; then
+    echo -e "${YELLOW}wireguard-tools not found. Installing...${NC}"
+    sudo pacman -S --noconfirm wireguard-tools
+fi
+
+# Check for nftables (required for kill switch)
+if ! command -v nft &> /dev/null; then
+    echo -e "${YELLOW}nftables not found. Installing...${NC}"
+    sudo pacman -S --noconfirm nftables
+fi
+
 # Build if not already built
 if [ ! -f "target/release/tonneru" ]; then
     echo "Building tonneru..."

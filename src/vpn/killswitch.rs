@@ -22,7 +22,9 @@ pub async fn enable() -> Result<()> {
 }
 
 /// Disable the kill switch using the secure helper
+/// This is robust - it will retry and verify the kill switch is actually off
 pub async fn disable() -> Result<()> {
+    // First attempt
     match run_helper(&["killswitch-off"]).await {
         Ok(output) => {
             if !output.status.success() {
@@ -34,11 +36,30 @@ pub async fn disable() -> Result<()> {
             }
         }
         Err(e) => {
-            tracing::warn!("Kill switch disable failed: {}", e);
+            tracing::warn!("Kill switch disable attempt 1 failed: {}", e);
         }
     }
 
-    tracing::info!("Kill switch disabled");
+    // Verify it's actually disabled
+    if is_enabled().await.unwrap_or(false) {
+        tracing::warn!("Kill switch still enabled after first attempt, retrying...");
+        
+        // Second attempt
+        if let Ok(output) = run_helper(&["killswitch-off"]).await {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::error!("Kill switch disable retry failed: {}", stderr);
+            }
+        }
+        
+        // Final check
+        if is_enabled().await.unwrap_or(false) {
+            tracing::error!("CRITICAL: Kill switch could not be disabled!");
+            anyhow::bail!("Failed to disable kill switch after multiple attempts");
+        }
+    }
+
+    tracing::info!("Kill switch disabled successfully");
     Ok(())
 }
 

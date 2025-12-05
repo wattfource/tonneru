@@ -202,10 +202,31 @@ EOF
 cmd_killswitch_off() {
     log_info "Disabling kill switch"
     
-    # Delete the table (ignore errors if it doesn't exist)
+    # Method 1: Delete our specific table (preferred - surgical removal)
     /usr/bin/nft delete table inet "$NFT_TABLE" 2>/dev/null || true
     
-    log_info "Kill switch disabled"
+    # Method 2: Double-check it's gone by listing and deleting again if found
+    if /usr/bin/nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        log_info "Table still exists, forcing removal..."
+        /usr/bin/nft flush table inet "$NFT_TABLE" 2>/dev/null || true
+        /usr/bin/nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+    fi
+    
+    # Method 3: If table STILL exists (shouldn't happen), use flush ruleset on our table
+    if /usr/bin/nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        log_error "Kill switch table persists, attempting aggressive removal"
+        # Create empty table definition to overwrite, then delete
+        echo "table inet $NFT_TABLE {}" | /usr/bin/nft -f - 2>/dev/null || true
+        /usr/bin/nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+    fi
+    
+    # Verify removal
+    if /usr/bin/nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        log_error "CRITICAL: Failed to remove kill switch table!"
+        return 1
+    fi
+    
+    log_info "Kill switch disabled successfully"
     return 0
 }
 
