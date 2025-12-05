@@ -40,15 +40,25 @@ fi
 
 # Install binary (same as PKGBUILD)
 echo "󰖂 Installing binary to /usr/bin/tonneru..."
-sudo install -Dm755 target/release/tonneru /usr/bin/tonneru
+if ! sudo install -Dm755 target/release/tonneru /usr/bin/tonneru; then
+    echo "ERROR: Failed to install binary. Are you running from a terminal with sudo access?"
+    exit 1
+fi
 
 # Install secure helper script
 echo "󰖂 Installing secure helper script..."
-sudo install -Dm755 packaging/usr/lib/tonneru/tonneru-sudo /usr/lib/tonneru/tonneru-sudo
+if ! sudo install -Dm755 packaging/usr/lib/tonneru/tonneru-sudo /usr/lib/tonneru/tonneru-sudo; then
+    echo "ERROR: Failed to install helper script."
+    exit 1
+fi
 
 # Install sudoers (same as PKGBUILD)
 echo "󰖂 Installing sudoers rules..."
-sudo install -Dm440 packaging/sudoers/tonneru /etc/sudoers.d/tonneru
+if ! sudo install -Dm440 packaging/sudoers/tonneru /etc/sudoers.d/tonneru; then
+    echo "ERROR: Failed to install sudoers file. Run manually:"
+    echo "  sudo install -Dm440 $PWD/packaging/sudoers/tonneru /etc/sudoers.d/tonneru"
+    exit 1
+fi
 
 # Install systemd user service to system location (same as PKGBUILD)
 echo "󰖂 Installing systemd user service..."
