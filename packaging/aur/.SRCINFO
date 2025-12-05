@@ -1,5 +1,5 @@
 pkgbase = tonneru
-	pkgdesc = A terminal-friendly VPN manager for Arch Linux / Omarchy
+	pkgdesc = A WireGuard VPN manager for Omarchy (Arch Linux)
 	pkgver = 0.1.0
 	pkgrel = 1
 	url = https://github.com/WattForce/tonneru

@@ -1,6 +1,6 @@
 # 󰖂 tonneru
 
-A terminal-friendly VPN manager for Arch Linux / Omarchy. Built with Rust and ratatui.
+A WireGuard VPN manager for Omarchy (Arch Linux). Built with Rust and ratatui.
 
 ![tonneru](https://img.shields.io/badge/arch-linux-1793d1?logo=archlinux&logoColor=white)
 ![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)
