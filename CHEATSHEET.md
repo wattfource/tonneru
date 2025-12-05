@@ -3,15 +3,16 @@
 ## First Time Install
 
 ```bash
-cd ~/Cursor/Metatron/arched-tunnel
-./update.sh
+cd /path/to/tonneru
+./install.sh
 systemctl --user enable --now tonneru.service
 ```
 
 ## Update (after code changes)
 
 ```bash
-cd ~/Cursor/Metatron/arched-tunnel && ./update.sh
+cd /path/to/tonneru
+./update.sh
 ```
 
 Quick mode (skip rebuild if binary exists):
