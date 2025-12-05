@@ -25,16 +25,32 @@ else
     echo "󰖂 Skipping build (quick mode)"
 fi
 
+# Create tonneru group if it doesn't exist
+if ! getent group tonneru >/dev/null 2>&1; then
+    echo "󰖂 Creating tonneru group..."
+    sudo groupadd -r tonneru
+fi
+
+# Add current user to tonneru group if not already a member
+if ! groups | grep -q '\btonneru\b'; then
+    echo "󰖂 Adding $USER to tonneru group..."
+    sudo usermod -aG tonneru "$USER"
+    echo "   NOTE: Log out and back in for group membership to take effect"
+fi
+
 # Install binary (same as PKGBUILD)
 echo "󰖂 Installing binary to /usr/bin/tonneru..."
 sudo install -Dm755 target/release/tonneru /usr/bin/tonneru
+
+# Install secure helper script
+echo "󰖂 Installing secure helper script..."
+sudo install -Dm755 packaging/usr/lib/tonneru/tonneru-sudo /usr/lib/tonneru/tonneru-sudo
 
 # Install sudoers (same as PKGBUILD)
 echo "󰖂 Installing sudoers rules..."
 sudo install -Dm440 packaging/sudoers/tonneru /etc/sudoers.d/tonneru
 
 # Install systemd user service to system location (same as PKGBUILD)
-# This is where AUR packages install user services
 echo "󰖂 Installing systemd user service..."
 sudo install -Dm644 packaging/systemd/tonneru.service /usr/lib/systemd/user/tonneru.service
 

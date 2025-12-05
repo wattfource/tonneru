@@ -25,9 +25,26 @@ if [ ! -f "target/release/tonneru" ]; then
     cargo build --release
 fi
 
+# Create tonneru group if it doesn't exist
+if ! getent group tonneru >/dev/null 2>&1; then
+    echo "Creating tonneru group..."
+    sudo groupadd -r tonneru
+fi
+
+# Add current user to tonneru group if not already a member
+if ! groups | grep -q '\btonneru\b'; then
+    echo "Adding $USER to tonneru group..."
+    sudo usermod -aG tonneru "$USER"
+    echo -e "${YELLOW}NOTE: You must log out and back in for group membership to take effect${NC}"
+fi
+
 # Install binary
 echo "Installing binary to /usr/bin/tonneru..."
 sudo install -Dm755 target/release/tonneru /usr/bin/tonneru
+
+# Install secure helper script
+echo "Installing secure helper script..."
+sudo install -Dm755 packaging/usr/lib/tonneru/tonneru-sudo /usr/lib/tonneru/tonneru-sudo
 
 # Install sudoers for passwordless VPN management
 echo "Installing sudoers rule..."
@@ -127,6 +144,8 @@ echo -e "${GREEN}═════════════════════
 echo -e "${GREEN}󰖂 tonneru installed successfully!${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════${NC}"
 echo ""
+echo -e "${YELLOW}IMPORTANT: Log out and back in for group membership to take effect${NC}"
+echo ""
 echo "Quick start:"
 echo "  tonneru              - Launch TUI"
 echo "  tonneru --daemon     - Run daemon (or use systemd service)"
@@ -137,4 +156,8 @@ echo "  systemctl --user status tonneru   - Check service status"
 echo "  systemctl --user restart tonneru  - Restart daemon"
 echo "  journalctl --user -u tonneru -f   - View logs"
 echo ""
-
+echo "Security:"
+echo "  - Uses dedicated 'tonneru' group (not wheel)"
+echo "  - Single auditable helper script for privileged ops"
+echo "  - All operations logged to: journalctl -t tonneru-sudo"
+echo ""

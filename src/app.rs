@@ -2,7 +2,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::Instant;
 
-use crate::config::{AppConfig, NetworkRule};
+use crate::config::{AppConfig, NetworkRule, TunnelInfo};
 use crate::network::{NetworkInfo, ConnectivityStatus};
 use crate::vpn::wireguard::{WgProfile, WgStatus, VpnHealthCheck};
 
@@ -131,7 +131,7 @@ impl App {
         let connectivity = crate::network::check_connectivity().await;
         let vpn_health = crate::vpn::wireguard::health_check().await;
 
-        Ok(Self {
+        let mut app = Self {
             section: Section::Networks,
             popup: Popup::None,
 
@@ -180,7 +180,48 @@ impl App {
             last_connectivity_check: Instant::now(),
             vpn_health,
             last_health_check: Instant::now(),
-        })
+        };
+
+        // If connected to a tunnel, restore its kill switch setting
+        if app.vpn_status.connected {
+            if let Some(iface) = &app.vpn_status.interface {
+                let tunnel_ks = app.get_tunnel_info(iface)
+                    .map(|t| t.kill_switch)
+                    .unwrap_or(false);
+                if tunnel_ks {
+                    // Enable kill switch for this tunnel (no countdown on startup)
+                    if crate::vpn::killswitch::enable().await.is_ok() {
+                        app.kill_switch_enabled = true;
+                    }
+                }
+            }
+        }
+
+        Ok(app)
+    }
+
+    /// Get TunnelInfo for a tunnel by name
+    fn get_tunnel_info(&self, name: &str) -> Option<&TunnelInfo> {
+        self.config.known_tunnels.iter().find(|t| t.name == name)
+    }
+
+    /// Ensure a tunnel exists in known_tunnels and return mutable reference
+    fn ensure_tunnel_info(&mut self, name: &str) -> &mut TunnelInfo {
+        if !self.config.known_tunnels.iter().any(|t| t.name == name) {
+            self.config.known_tunnels.push(TunnelInfo {
+                name: name.to_string(),
+                protocol: "wireguard".to_string(),
+                kill_switch: false,
+            });
+        }
+        self.config.known_tunnels.iter_mut().find(|t| t.name == name).unwrap()
+    }
+
+    /// Set kill switch for a specific tunnel
+    fn set_tunnel_kill_switch(&mut self, name: &str, enabled: bool) {
+        let tunnel = self.ensure_tunnel_info(name);
+        tunnel.kill_switch = enabled;
+        let _ = self.config.save();
     }
 
     /// Load the config file for the currently selected tunnel
@@ -512,17 +553,41 @@ impl App {
         }
 
         if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
-            if self.vpn_status.connected && self.vpn_status.interface.as_deref() == Some(&tunnel.name) {
+            let tunnel_name = tunnel.name.clone();
+            if self.vpn_status.connected && self.vpn_status.interface.as_deref() == Some(&tunnel_name) {
                 // Already connected, disconnect
+                // Disable kill switch when disconnecting
+                if self.kill_switch_enabled {
+                    let _ = crate::vpn::killswitch::disable().await;
+                    self.kill_switch_enabled = false;
+                }
                 crate::vpn::wireguard::disconnect().await?;
                 self.status_message = Some("Disconnected".to_string());
             } else {
-                // Disconnect any existing first
+                // Disconnect any existing first (and their kill switch)
                 if self.vpn_status.connected {
+                    if self.kill_switch_enabled {
+                        let _ = crate::vpn::killswitch::disable().await;
+                        self.kill_switch_enabled = false;
+                    }
                     crate::vpn::wireguard::disconnect().await?;
                 }
-                crate::vpn::wireguard::connect(&tunnel.name).await?;
-                self.status_message = Some(format!("Connected to {}", tunnel.name));
+                crate::vpn::wireguard::connect(&tunnel_name).await?;
+                
+                // Apply the tunnel's kill switch setting
+                let tunnel_ks = self.get_tunnel_info(&tunnel_name)
+                    .map(|t| t.kill_switch)
+                    .unwrap_or(false);
+                if tunnel_ks {
+                    if let Ok(_) = crate::vpn::killswitch::enable().await {
+                        self.kill_switch_enabled = true;
+                        self.status_message = Some(format!("Connected to {} (kill switch on)", tunnel_name));
+                    } else {
+                        self.status_message = Some(format!("Connected to {}", tunnel_name));
+                    }
+                } else {
+                    self.status_message = Some(format!("Connected to {}", tunnel_name));
+                }
             }
             self.refresh().await?;
         }
@@ -1221,7 +1286,20 @@ impl App {
                         self.status_message = Some(format!("Connecting to {}...", tunnel));
                         match crate::vpn::wireguard::connect(tunnel).await {
                             Ok(_) => {
-                                self.status_message = Some(format!("Connected to {}", tunnel));
+                                // Apply tunnel's kill switch setting
+                                let tunnel_ks = self.get_tunnel_info(tunnel)
+                                    .map(|t| t.kill_switch)
+                                    .unwrap_or(false);
+                                if tunnel_ks {
+                                    if let Ok(_) = crate::vpn::killswitch::enable().await {
+                                        self.kill_switch_enabled = true;
+                                        self.status_message = Some(format!("Connected to {} (kill switch on)", tunnel));
+                                    } else {
+                                        self.status_message = Some(format!("Connected to {}", tunnel));
+                                    }
+                                } else {
+                                    self.status_message = Some(format!("Connected to {}", tunnel));
+                                }
                             }
                             Err(e) => {
                                 self.status_message = Some(format!("Error: {}", e));
@@ -1231,6 +1309,11 @@ impl App {
                 }
                 PendingAction::Disconnect => {
                     self.status_message = Some("Disconnecting...".to_string());
+                    // Disable kill switch when disconnecting
+                    if self.kill_switch_enabled {
+                        let _ = crate::vpn::killswitch::disable().await;
+                        self.kill_switch_enabled = false;
+                    }
                     match crate::vpn::wireguard::disconnect().await {
                         Ok(_) => {
                             self.status_message = Some("Disconnected".to_string());
@@ -1243,10 +1326,28 @@ impl App {
                 PendingAction::Reconnect => {
                     if let Some(tunnel) = &change.tunnel_name {
                         self.status_message = Some(format!("Switching to {}...", tunnel));
+                        // Disable old kill switch before switching
+                        if self.kill_switch_enabled {
+                            let _ = crate::vpn::killswitch::disable().await;
+                            self.kill_switch_enabled = false;
+                        }
                         let _ = crate::vpn::wireguard::disconnect().await;
                         match crate::vpn::wireguard::connect(tunnel).await {
                             Ok(_) => {
-                                self.status_message = Some(format!("Connected to {}", tunnel));
+                                // Apply new tunnel's kill switch setting
+                                let tunnel_ks = self.get_tunnel_info(tunnel)
+                                    .map(|t| t.kill_switch)
+                                    .unwrap_or(false);
+                                if tunnel_ks {
+                                    if let Ok(_) = crate::vpn::killswitch::enable().await {
+                                        self.kill_switch_enabled = true;
+                                        self.status_message = Some(format!("Connected to {} (kill switch on)", tunnel));
+                                    } else {
+                                        self.status_message = Some(format!("Connected to {}", tunnel));
+                                    }
+                                } else {
+                                    self.status_message = Some(format!("Connected to {}", tunnel));
+                                }
                             }
                             Err(e) => {
                                 self.status_message = Some(format!("Error: {}", e));
@@ -1259,9 +1360,15 @@ impl App {
                     match crate::vpn::killswitch::enable().await {
                         Ok(_) => {
                             self.kill_switch_enabled = true;
-                            self.config.kill_switch = true;
-                            let _ = self.config.save();
-                            self.status_message = Some("Kill switch enabled".to_string());
+                            // Save per-tunnel if connected, otherwise global
+                            if let Some(iface) = self.vpn_status.interface.clone() {
+                                self.set_tunnel_kill_switch(&iface, true);
+                                self.status_message = Some(format!("Kill switch enabled for {}", iface));
+                            } else {
+                                self.config.kill_switch = true;
+                                let _ = self.config.save();
+                                self.status_message = Some("Kill switch enabled".to_string());
+                            }
                         }
                         Err(e) => {
                             self.status_message = Some(format!("Error: {}", e));
@@ -1273,9 +1380,15 @@ impl App {
                     match crate::vpn::killswitch::disable().await {
                         Ok(_) => {
                             self.kill_switch_enabled = false;
-                            self.config.kill_switch = false;
-                            let _ = self.config.save();
-                            self.status_message = Some("Kill switch disabled".to_string());
+                            // Save per-tunnel if connected, otherwise global
+                            if let Some(iface) = self.vpn_status.interface.clone() {
+                                self.set_tunnel_kill_switch(&iface, false);
+                                self.status_message = Some(format!("Kill switch disabled for {}", iface));
+                            } else {
+                                self.config.kill_switch = false;
+                                let _ = self.config.save();
+                                self.status_message = Some("Kill switch disabled".to_string());
+                            }
                         }
                         Err(e) => {
                             self.status_message = Some(format!("Error: {}", e));

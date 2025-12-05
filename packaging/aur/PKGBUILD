@@ -45,7 +45,11 @@ package() {
     # Install binary
     install -Dm755 "target/release/tonneru" "$pkgdir/usr/bin/tonneru"
     
-    # Install sudoers file for passwordless VPN management
+    # Install secure helper script (single point of privilege escalation)
+    install -Dm755 "packaging/usr/lib/tonneru/tonneru-sudo" \
+        "$pkgdir/usr/lib/tonneru/tonneru-sudo"
+    
+    # Install sudoers file (allows tonneru group to use helper without password)
     install -Dm440 "packaging/sudoers/tonneru" \
         "$pkgdir/etc/sudoers.d/tonneru"
     

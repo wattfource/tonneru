@@ -1,12 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-use tokio::time::timeout;
 
-use super::run_command_with_timeout;
-use super::SUDO_TIMEOUT;
-
-const WG_CONFIG_DIR: &str = "/etc/wireguard";
+use super::run_helper;
+use super::run_helper_with_stdin;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WgProfile {
@@ -39,39 +36,15 @@ pub async fn list_profiles() -> Result<Vec<WgProfile>> {
     let status = get_status().await.unwrap_or_default();
     let active_interface = status.interface.clone();
 
-    // First, get list of actually existing .conf files in /etc/wireguard
-    // Try with sudo first since /etc/wireguard is typically root-only
-    if let Ok(output) = run_command_with_timeout("sudo", &["ls", "-1", WG_CONFIG_DIR]).await {
+    // Get list of config files using helper
+    if let Ok(output) = run_helper(&["config-list"]).await {
         if output.status.success() {
             could_read_config_dir = true;
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
-                if let Some(name) = line.strip_suffix(".conf") {
-                    // Validate it's a reasonable name (not error output)
-                    if !name.is_empty() && !name.contains(' ') && !name.contains(':') {
-                        valid_configs.insert(name.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: try without sudo (might work on some systems)
-    if !could_read_config_dir {
-    let output = Command::new("ls")
-        .args(["-1", WG_CONFIG_DIR])
-        .output();
-
-    if let Ok(output) = output {
-        if output.status.success() {
-                could_read_config_dir = true;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some(name) = line.strip_suffix(".conf") {
-                        if !name.is_empty() && !name.contains(' ') && !name.contains(':') {
+                let name = line.trim();
+                if !name.is_empty() {
                     valid_configs.insert(name.to_string());
-                        }
-                    }
                 }
             }
         }
@@ -99,17 +72,16 @@ pub async fn list_profiles() -> Result<Vec<WgProfile>> {
     // Load our config
     if let Ok(mut config) = crate::config::AppConfig::load() {
         // Only clean up orphaned entries if we could actually read the config directory
-        // This prevents accidentally removing valid tunnels when we don't have permission
         if could_read_config_dir {
-        let original_len = config.known_tunnels.len();
-        
-        // Only keep tunnels that have valid configs
-        config.known_tunnels.retain(|t| {
-            t.protocol != "wireguard" || valid_configs.contains(&t.name)
-        });
-        
-        if config.known_tunnels.len() != original_len {
-            let _ = config.save(); // Auto-cleanup orphaned entries
+            let original_len = config.known_tunnels.len();
+            
+            // Only keep tunnels that have valid configs
+            config.known_tunnels.retain(|t| {
+                t.protocol != "wireguard" || valid_configs.contains(&t.name)
+            });
+            
+            if config.known_tunnels.len() != original_len {
+                let _ = config.save(); // Auto-cleanup orphaned entries
             }
         }
         
@@ -127,7 +99,7 @@ pub async fn list_profiles() -> Result<Vec<WgProfile>> {
         }
     }
 
-    // Add any configs from /etc/wireguard that aren't in our known_tunnels
+    // Add any configs that aren't in our known_tunnels
     for name in &valid_configs {
         if !seen_names.contains(name) {
             let connected = active_interface.as_ref().map(|s| s.as_str()) == Some(name.as_str());
@@ -146,28 +118,14 @@ pub async fn list_profiles() -> Result<Vec<WgProfile>> {
 
 /// Get current WireGuard connection status
 pub async fn get_status() -> Result<WgStatus> {
-    // Try with sudo first (works with sudoers rule) - with timeout to prevent hanging
-    if let Ok(output) = run_command_with_timeout("sudo", &["wg", "show"]).await {
+    // Use helper to get status
+    if let Ok(output) = run_helper(&["status"]).await {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if !stdout.trim().is_empty() {
                 return parse_wg_show_output(&stdout);
             }
         }
-    }
-
-    // Fallback: try without sudo (works if user has CAP_NET_ADMIN)
-    // This is quick and won't block, so no timeout needed
-    let output = Command::new("wg").arg("show").output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.trim().is_empty() {
-                return parse_wg_show_output(&stdout);
-            }
-        }
-        _ => {}
     }
 
     // Fallback: check if any wg interface exists via ip link
@@ -233,15 +191,11 @@ fn parse_wg_show_output(stdout: &str) -> Result<WgStatus> {
         status.routing_ok = check_vpn_routing(iface);
     }
 
-    // Connection is only truly "good" if handshake is recent and routing is OK
-    // We still show connected=true if interface exists, but UI can use other fields
-
     Ok(status)
 }
 
 /// Check if handshake is stale (older than 3 minutes)
 fn is_handshake_stale(handshake: &str) -> bool {
-    // WireGuard outputs like "23 seconds ago", "1 minute, 45 seconds ago", "5 minutes ago"
     let handshake_lower = handshake.to_lowercase();
     
     // If it says "hour" or "day", definitely stale
@@ -251,7 +205,6 @@ fn is_handshake_stale(handshake: &str) -> bool {
     
     // Parse minutes
     if handshake_lower.contains("minute") {
-        // Extract number before "minute"
         for part in handshake_lower.split_whitespace() {
             if let Ok(mins) = part.parse::<u32>() {
                 return mins >= 3;
@@ -270,7 +223,6 @@ fn is_handshake_stale(handshake: &str) -> bool {
 
 /// Check if there's been meaningful traffic (not just handshake bytes)
 fn has_meaningful_traffic(rx: &str, tx: &str) -> bool {
-    // Parse values like "1.5 KiB", "234 B", "15.2 MiB"
     let parse_bytes = |s: &str| -> u64 {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() >= 2 {
@@ -305,9 +257,6 @@ fn check_vpn_routing(vpn_interface: &str) -> bool {
     if let Ok(output) = output {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Check if VPN interface is in the default route
-            // WireGuard typically adds routes like "0.0.0.0/1" and "128.0.0.0/1" 
-            // or replaces the default route
             if stdout.contains(vpn_interface) {
                 return true;
             }
@@ -323,7 +272,6 @@ fn check_vpn_routing(vpn_interface: &str) -> bool {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
-                // Check for WireGuard's typical routes through the VPN interface
                 if line.contains(vpn_interface) && 
                    (line.starts_with("0.0.0.0/1") || line.starts_with("128.0.0.0/1") || line.starts_with("default")) {
                     return true;
@@ -335,13 +283,13 @@ fn check_vpn_routing(vpn_interface: &str) -> bool {
     false
 }
 
-/// Connect to a WireGuard profile using wg-quick
+/// Connect to a WireGuard profile using the secure helper
 pub async fn connect(profile_name: &str) -> Result<()> {
     // First disconnect any existing connection
     let _ = disconnect().await;
 
-    let output = run_command_with_timeout("sudo", &["wg-quick", "up", profile_name]).await
-        .context("Failed to execute wg-quick up")?;
+    let output = run_helper(&["connect", profile_name]).await
+        .context("Failed to execute connect")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -353,19 +301,16 @@ pub async fn connect(profile_name: &str) -> Result<()> {
 
 /// Disconnect from current WireGuard connection
 pub async fn disconnect() -> Result<()> {
-    let status = get_status().await?;
-
-    if let Some(interface) = status.interface {
-        match run_command_with_timeout("sudo", &["wg-quick", "down", &interface]).await {
-            Ok(output) => {
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("Failed to disconnect: {}", stderr);
-                }
+    // Helper will auto-detect the active interface
+    match run_helper(&["disconnect"]).await {
+        Ok(output) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!("Failed to disconnect: {}", stderr);
             }
-            Err(e) => {
-                tracing::warn!("Disconnect command failed: {}", e);
-            }
+        }
+        Err(e) => {
+            tracing::warn!("Disconnect command failed: {}", e);
         }
     }
 
@@ -374,7 +319,7 @@ pub async fn disconnect() -> Result<()> {
 
 /// Add a new WireGuard profile and save to our config
 pub async fn add_profile(name: &str, config_content: &str) -> Result<()> {
-    // Sanitize the name
+    // Sanitize the name (helper also validates, but we do it here too)
     let safe_name: String = name
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
@@ -384,59 +329,33 @@ pub async fn add_profile(name: &str, config_content: &str) -> Result<()> {
         anyhow::bail!("Invalid profile name");
     }
 
-    let config_path = format!("{}/{}.conf", WG_CONFIG_DIR, safe_name);
-
     // Validate the config
     if !config_content.contains("[Interface]") || !config_content.contains("[Peer]") {
         anyhow::bail!("Invalid WireGuard config: missing [Interface] or [Peer] section");
     }
 
-    // Create directory if needed
-    let _ = run_command_with_timeout("sudo", &["mkdir", "-p", WG_CONFIG_DIR]).await;
+    // Write config using helper
+    let output = run_helper_with_stdin(&["config-write", &safe_name], config_content).await
+        .context("Failed to write config")?;
 
-    // Write config using tee with sudo - need to handle this specially with timeout
-    let config_content_clone = config_content.to_string();
-    let config_path_clone = config_path.clone();
-    
-    let write_result = timeout(SUDO_TIMEOUT, tokio::task::spawn_blocking(move || {
-    let mut child = Command::new("sudo")
-            .args(["tee", &config_path_clone])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-            .spawn()?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        use std::io::Write;
-            stdin.write_all(config_content_clone.as_bytes())?;
-    }
-
-        child.wait_with_output()
-    })).await;
-
-    match write_result {
-        Ok(Ok(Ok(output))) => {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Failed to save profile: {}", stderr);
-            }
-        }
-        Ok(Ok(Err(e))) => anyhow::bail!("Failed to save profile: {}", e),
-        Ok(Err(e)) => anyhow::bail!("Task failed: {}", e),
-        Err(_) => anyhow::bail!("Save timed out (sudo may need password)"),
     }
-
-    // Set permissions
-    let _ = run_command_with_timeout("sudo", &["chmod", "600", &config_path]).await;
 
     // Save to our config so we remember it
     let mut config = crate::config::AppConfig::load().unwrap_or_default();
     
-    // Remove if exists, then add
+    // Preserve kill_switch setting if tunnel existed
+    let existing_ks = config.known_tunnels.iter()
+        .find(|t| t.name == safe_name)
+        .map(|t| t.kill_switch)
+        .unwrap_or(false);
     config.known_tunnels.retain(|t| t.name != safe_name);
     config.known_tunnels.push(crate::config::TunnelInfo {
         name: safe_name.clone(),
         protocol: "wireguard".to_string(),
+        kill_switch: existing_ks,
     });
     config.save()?;
 
@@ -449,13 +368,10 @@ pub async fn delete_profile(name: &str) -> Result<()> {
     // Disconnect if connected
     let status = get_status().await.unwrap_or_default();
     if status.interface.as_deref() == Some(name) {
-        // Don't fail if disconnect fails - still try to delete the profile
         let _ = disconnect().await;
     }
 
-    let config_path = format!("{}/{}.conf", WG_CONFIG_DIR, name);
-
-    let output = run_command_with_timeout("sudo", &["rm", "-f", &config_path]).await
+    let output = run_helper(&["config-delete", name]).await
         .context("Failed to delete WireGuard config")?;
 
     if !output.status.success() {
@@ -516,7 +432,6 @@ pub async fn health_check() -> VpnHealthCheck {
     result.routing_configured = status.routing_ok;
     
     // Try to reach the internet through the VPN
-    // This verifies end-to-end connectivity
     let start = std::time::Instant::now();
     
     // Use ping to 1.1.1.1 with a short timeout
@@ -573,7 +488,6 @@ pub async fn refresh_connection() -> Result<()> {
     
     // Get the endpoint IP and ping it to force traffic
     if let Some(endpoint) = &status.endpoint {
-        // Extract IP from "IP:port" format
         if let Some(ip) = endpoint.split(':').next() {
             let _ = Command::new("ping")
                 .args(["-c", "1", "-W", "2", ip])

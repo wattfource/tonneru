@@ -42,6 +42,8 @@ pub struct AppConfig {
 pub struct TunnelInfo {
     pub name: String,
     pub protocol: String,  // "wireguard", "openvpn", etc.
+    #[serde(default)]
+    pub kill_switch: bool,  // Per-tunnel kill switch setting
 }
 
 impl AppConfig {
@@ -130,6 +132,7 @@ mod tests {
             known_tunnels: vec![TunnelInfo {
                 name: "my-vpn".to_string(),
                 protocol: "wireguard".to_string(),
+                kill_switch: false,
             }],
         };
 
