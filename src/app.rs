@@ -98,12 +98,6 @@ pub struct App {
 
     // Info line content
     pub info_message: Option<String>,    // Current info message (traffic, status, etc.)
-
-    // Session tracking (for traffic stats)
-    pub session_start: Instant,          // When app/VPN session started
-    pub session_baseline_rx: u64,        // RX bytes at session start
-    pub session_baseline_tx: u64,        // TX bytes at session start
-    pub session_interface: Option<String>, // Which interface we're tracking
     
     // Rate limiting for status refresh
     pub last_status_refresh: Instant,    // When we last refreshed VPN status
@@ -177,10 +171,6 @@ impl App {
             countdown_seconds: 0,
             info_message: None,
 
-            session_start: Instant::now(),
-            session_baseline_rx: 0,
-            session_baseline_tx: 0,
-            session_interface: None,
             last_status_refresh: Instant::now(),
             
             connectivity,
@@ -1252,22 +1242,6 @@ impl App {
     /// Update the info message with current status/traffic
     fn update_info_message(&mut self) {
         if self.vpn_status.connected {
-            let current_iface = self.vpn_status.interface.clone();
-            
-            // Check if interface changed - reset session tracking
-            if self.session_interface != current_iface {
-                self.session_interface = current_iface.clone();
-                self.session_start = Instant::now();
-                
-                // Set baseline from current transfer values
-                if let Some(ref rx) = self.vpn_status.transfer_rx {
-                    self.session_baseline_rx = Self::parse_transfer_to_bytes(rx);
-                }
-                if let Some(ref tx) = self.vpn_status.transfer_tx {
-                    self.session_baseline_tx = Self::parse_transfer_to_bytes(tx);
-                }
-            }
-            
             let mut parts = Vec::new();
             
             // VPN health indicator
@@ -1289,21 +1263,21 @@ impl App {
                 parts.push(format!("󰩟 {}", ip));
             }
             
-            // Session duration
-            let session_secs = self.session_start.elapsed().as_secs();
-            parts.push(format!("󰔟 {}", Self::format_duration(session_secs)));
+            // Session duration - use actual interface uptime from system
+            if let Some(ref iface) = self.vpn_status.interface {
+                if let Some(uptime_secs) = crate::vpn::wireguard::get_interface_uptime(iface) {
+                    parts.push(format!("󰔟 {}", Self::format_duration(uptime_secs)));
+                }
+            }
             
-            // Session traffic (current - baseline)
+            // Cumulative session traffic (total since connection established)
             if let (Some(ref rx), Some(ref tx)) = (&self.vpn_status.transfer_rx, &self.vpn_status.transfer_tx) {
-                let current_rx = Self::parse_transfer_to_bytes(rx);
-                let current_tx = Self::parse_transfer_to_bytes(tx);
-                
-                let session_rx = current_rx.saturating_sub(self.session_baseline_rx);
-                let session_tx = current_tx.saturating_sub(self.session_baseline_tx);
+                let total_rx = Self::parse_transfer_to_bytes(rx);
+                let total_tx = Self::parse_transfer_to_bytes(tx);
                 
                 parts.push(format!("↓{} ↑{}", 
-                    Self::format_bytes(session_rx), 
-                    Self::format_bytes(session_tx)
+                    Self::format_bytes(total_rx), 
+                    Self::format_bytes(total_tx)
                 ));
             }
             
@@ -1324,13 +1298,6 @@ impl App {
                 Some(parts.join(" │ "))
             };
         } else {
-            // Reset session tracking when disconnected
-            if self.session_interface.is_some() {
-                self.session_interface = None;
-                self.session_baseline_rx = 0;
-                self.session_baseline_tx = 0;
-            }
-            
             // Show network connectivity status
             if !self.connectivity.has_interface {
                 self.info_message = Some("󰤭 No network".to_string());

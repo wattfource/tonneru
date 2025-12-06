@@ -470,6 +470,17 @@ pub async fn health_check() -> VpnHealthCheck {
     result
 }
 
+/// Get the uptime of a network interface in seconds
+/// Reads the modification time of /sys/class/net/<interface>/uevent which corresponds
+/// to when the interface was created
+pub fn get_interface_uptime(interface: &str) -> Option<u64> {
+    let path = format!("/sys/class/net/{}/uevent", interface);
+    let metadata = std::fs::metadata(&path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let elapsed = modified.elapsed().ok()?;
+    Some(elapsed.as_secs())
+}
+
 /// Quick check if VPN interface exists and has recent handshake
 #[allow(dead_code)]
 pub async fn is_alive() -> bool {
