@@ -235,16 +235,12 @@ impl App {
     }
 
     /// Load the config file for the currently selected tunnel
-    pub fn load_selected_tunnel_config(&mut self) {
+    pub async fn load_selected_tunnel_config(&mut self) {
         if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
-            let config_path = format!("/etc/wireguard/{}.conf", tunnel.name);
+            let tunnel_name = tunnel.name.clone();
             
-            // Try to read the file (may need sudo)
-            let output = std::process::Command::new("sudo")
-                .args(["cat", &config_path])
-                .output();
-
-            match output {
+            // Use the helper to read config (passwordless sudo)
+            match crate::vpn::run_helper(&["config-read", &tunnel_name]).await {
                 Ok(output) if output.status.success() => {
                     let content = String::from_utf8_lossy(&output.stdout).to_string();
                     self.tunnel_config_content = content.clone();
@@ -359,8 +355,8 @@ impl App {
             }
 
             // Vertical navigation (j/down, up only - 'k' is for kill switch)
-            KeyCode::Char('j') | KeyCode::Down => self.move_down(),
-            KeyCode::Up => self.move_up(),
+            KeyCode::Char('j') | KeyCode::Down => self.move_down().await,
+            KeyCode::Up => self.move_up().await,
 
             // Actions based on section
             KeyCode::Char(' ') | KeyCode::Enter => {
@@ -380,7 +376,7 @@ impl App {
             // Expand config panel (only in Tunnels section)
             KeyCode::Char('c') => {
                 if self.section == Section::Tunnels && !self.tunnels.is_empty() {
-                    self.load_selected_tunnel_config();
+                    self.load_selected_tunnel_config().await;
                     self.show_config = true;
                     self.section = Section::TunnelConfig;
                 }
@@ -513,7 +509,7 @@ impl App {
         }
     }
 
-    fn move_down(&mut self) {
+    async fn move_down(&mut self) {
         match self.section {
             Section::Networks => {
                 if !self.networks.is_empty() {
@@ -526,7 +522,7 @@ impl App {
                     self.selected_tunnel = (self.selected_tunnel + 1) % self.tunnels.len();
                     // Load config if selection changed
                     if old_selection != self.selected_tunnel {
-                        self.load_selected_tunnel_config();
+                        self.load_selected_tunnel_config().await;
                     }
                 }
             }
@@ -543,7 +539,7 @@ impl App {
         }
     }
 
-    fn move_up(&mut self) {
+    async fn move_up(&mut self) {
         match self.section {
             Section::Networks => {
                 if !self.networks.is_empty() {
@@ -556,7 +552,7 @@ impl App {
                     self.selected_tunnel = self.selected_tunnel.checked_sub(1).unwrap_or(self.tunnels.len() - 1);
                     // Load config if selection changed
                     if old_selection != self.selected_tunnel {
-                        self.load_selected_tunnel_config();
+                        self.load_selected_tunnel_config().await;
                     }
                 }
             }
@@ -1169,10 +1165,10 @@ impl App {
         Ok(())
     }
 
-    /// Parse transfer string like "1.23 GiB" to bytes
+    /// Parse transfer string like "1.23 GiB" or "1.23 GiB received" to bytes
     fn parse_transfer_to_bytes(s: &str) -> u64 {
         let parts: Vec<&str> = s.trim().split_whitespace().collect();
-        if parts.len() != 2 {
+        if parts.len() < 2 {
             return 0;
         }
         
