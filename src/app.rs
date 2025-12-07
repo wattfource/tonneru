@@ -41,6 +41,7 @@ pub enum Popup {
     None,
     FileBrowser,
     ConfigPreview,
+    ManualConfig,  // Manual config creation (name + paste content)
     Help,
     Confirm,
 }
@@ -192,6 +193,30 @@ impl App {
             }
         }
 
+        // Auto-reconnect to last tunnel if enabled and not already connected
+        if !app.vpn_status.connected && app.config.auto_reconnect {
+            if let Some(ref last_tunnel) = app.config.last_connected {
+                // Check if this tunnel still exists
+                if app.tunnels.iter().any(|t| &t.name == last_tunnel) {
+                    tracing::info!("Auto-reconnecting to last tunnel: {}", last_tunnel);
+                    if let Ok(_) = crate::vpn::wireguard::connect(last_tunnel).await {
+                        // Refresh status after connecting
+                        app.vpn_status = crate::vpn::wireguard::get_status().await.unwrap_or_default();
+                        
+                        // Enable kill switch if tunnel has it configured
+                        let tunnel_ks = app.get_tunnel_info(last_tunnel)
+                            .map(|t| t.kill_switch)
+                            .unwrap_or(false);
+                        if tunnel_ks {
+                            if crate::vpn::killswitch::enable().await.is_ok() {
+                                app.kill_switch_enabled = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Load config for the initially selected tunnel
         app.load_selected_tunnel_config().await;
 
@@ -309,8 +334,15 @@ impl App {
                 }
             }
 
-            // File browser for importing
-            KeyCode::Char('f') => self.start_file_browser(),
+            // New manual config creation (only in Tunnels section)
+            KeyCode::Char('n') => {
+                if self.section == Section::Tunnels {
+                    self.start_manual_config();
+                }
+            }
+
+            // Import config from file browser
+            KeyCode::Char('i') => self.start_file_browser(),
             
             // Delete/remove
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
@@ -345,6 +377,7 @@ impl App {
         match self.popup {
             Popup::FileBrowser => self.handle_browser_key(key).await,
             Popup::ConfigPreview => self.handle_preview_key(key).await,
+            Popup::ManualConfig => self.handle_manual_config_key(key).await,
             Popup::Help => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Enter | KeyCode::Char('q')) {
                     self.popup = Popup::None;
@@ -414,7 +447,7 @@ impl App {
         }
     }
 
-    /// Edit tunnel config in external editor (sudoedit)
+    /// Edit tunnel config in external editor (opens new terminal window)
     async fn edit_tunnel_config_external(&mut self) -> Result<()> {
         if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
             let tunnel_name = tunnel.name.clone();
@@ -422,42 +455,57 @@ impl App {
                 && self.vpn_status.interface.as_deref() == Some(&tunnel_name);
             let config_path = format!("/etc/wireguard/{}.conf", tunnel_name);
             
-            self.set_status(format!("Opening {} in editor (sudo)...", tunnel_name));
+            self.set_status(format!("Opening {} in editor...", tunnel_name));
             
-            // Use sudoedit to properly edit root-owned config files
-            // This copies the file to a temp location, opens $EDITOR, then copies back
-            let result = std::process::Command::new("sudoedit")
-                .arg(&config_path)
-                .spawn();
+            // Open a new terminal window for editing
+            // This keeps the TUI intact and gives a clean prompt for sudo password
+            let edit_cmd = format!("sudoedit '{}'", config_path);
+            let title = format!("Edit {}", tunnel_name);
             
-            match result {
-                Ok(mut child) => {
-                    // Wait for editor to close
+            // Try different terminal emulators (foot is common on Wayland/Omarchy)
+            let terminals = [
+                ("foot", vec!["--title", &title, "-W", "80x24", "-e", "sh", "-c", &edit_cmd]),
+                ("kitty", vec!["--title", &title, "-e", "sh", "-c", &edit_cmd]),
+                ("alacritty", vec!["--title", &title, "-e", "sh", "-c", &edit_cmd]),
+                ("gnome-terminal", vec!["--title", &title, "--geometry=80x24", "--", "sh", "-c", &edit_cmd]),
+                ("xterm", vec!["-title", &title, "-geometry", "80x24", "-e", "sh", "-c", &edit_cmd]),
+            ];
+            
+            let mut spawned = false;
+            for (term, args) in &terminals {
+                if let Ok(mut child) = std::process::Command::new(term)
+                    .args(args)
+                    .spawn()
+                {
+                    // Wait for the terminal/editor to close
                     let _ = child.wait();
-                    
-                    // Reload the config content
-                    self.load_selected_tunnel_config().await;
-                    
-                    // If tunnel was connected, reconnect to apply changes
-                    if was_connected {
-                        self.set_status(format!("Reconnecting {} to apply changes...", tunnel_name));
-                        let _ = crate::vpn::wireguard::disconnect().await;
-                        match crate::vpn::wireguard::connect(&tunnel_name).await {
-                            Ok(_) => {
-                                self.set_status(format!("Config updated & {} reconnected", tunnel_name));
-                            }
-                            Err(e) => {
-                                self.set_status(format!("Reconnect failed: {}", e));
-                            }
+                    spawned = true;
+                    break;
+                }
+            }
+            
+            if spawned {
+                // Reload the config content
+                self.load_selected_tunnel_config().await;
+                
+                // If tunnel was connected, reconnect to apply changes
+                if was_connected {
+                    self.set_status(format!("Reconnecting {} to apply changes...", tunnel_name));
+                    let _ = crate::vpn::wireguard::disconnect().await;
+                    match crate::vpn::wireguard::connect(&tunnel_name).await {
+                        Ok(_) => {
+                            self.set_status(format!("Config updated & {} reconnected", tunnel_name));
                         }
-                        self.refresh().await?;
-                    } else {
-                        self.set_status(format!("Config reloaded for {}", tunnel_name));
+                        Err(e) => {
+                            self.set_status(format!("Reconnect failed: {}", e));
+                        }
                     }
+                    self.refresh().await?;
+                } else {
+                    self.set_status(format!("Config reloaded for {}", tunnel_name));
                 }
-                Err(e) => {
-                    self.set_status(format!("Failed to open editor: {}", e));
-                }
+            } else {
+                self.set_status("No terminal emulator found (tried foot, kitty, alacritty, gnome-terminal, xterm)");
             }
         }
         Ok(())
@@ -490,6 +538,10 @@ impl App {
                     crate::vpn::wireguard::disconnect().await?;
                 }
                 crate::vpn::wireguard::connect(&tunnel_name).await?;
+                
+                // Save last connected tunnel for auto-reconnect
+                self.config.last_connected = Some(tunnel_name.clone());
+                let _ = self.config.save();
                 
                 // Apply the tunnel's kill switch setting
                 let tunnel_ks = self.get_tunnel_info(&tunnel_name)
@@ -698,6 +750,88 @@ impl App {
         self.browser_path = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
         self.browser_selected = 0;
         self.refresh_browser();
+    }
+
+    /// Start manual config creation popup
+    fn start_manual_config(&mut self) {
+        self.popup = Popup::ManualConfig;
+        self.input_buffer.clear();  // Will hold the tunnel name
+        self.config_preview.clear();  // Will hold the config content
+        self.preview_field = 0;  // 0 = name field, 1 = content field
+    }
+
+    /// Handle key input for manual config creation popup
+    async fn handle_manual_config_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel and close
+                self.popup = Popup::None;
+                self.input_buffer.clear();
+                self.config_preview.clear();
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                // Toggle between name field (0) and content field (1)
+                self.preview_field = if self.preview_field == 0 { 1 } else { 0 };
+            }
+            KeyCode::F(2) => {
+                // F2 to save (when content is entered)
+                if !self.input_buffer.is_empty() && !self.config_preview.is_empty() {
+                    self.save_manual_config().await?;
+                } else {
+                    self.set_status("Enter name and config content first");
+                }
+            }
+            KeyCode::Enter => {
+                if self.preview_field == 0 {
+                    // Move from name to content field
+                    self.preview_field = 1;
+                } else {
+                    // In content field, Enter adds newline
+                    self.config_preview.push('\n');
+                }
+            }
+            KeyCode::Backspace => {
+                if self.preview_field == 0 {
+                    self.input_buffer.pop();
+                } else {
+                    self.config_preview.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if self.preview_field == 0 {
+                    // Name field: only valid filename characters
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        self.input_buffer.push(c);
+                    }
+                } else {
+                    // Content field: any character
+                    self.config_preview.push(c);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Save the manually created config
+    async fn save_manual_config(&mut self) -> Result<()> {
+        let name = self.input_buffer.clone();
+        let content = self.config_preview.clone();
+
+        match crate::vpn::wireguard::add_profile(&name, &content).await {
+            Ok(_) => {
+                self.set_status(format!("Created tunnel: {}", name));
+                let _ = self.refresh().await;
+                self.popup = Popup::None;
+                self.input_buffer.clear();
+                self.config_preview.clear();
+            }
+            Err(e) => {
+                self.set_status(format!("Failed: {}", e));
+                // Don't close popup on error
+            }
+        }
+        Ok(())
     }
 
     fn refresh_browser(&mut self) {
@@ -1164,14 +1298,19 @@ impl App {
                 ));
             }
             
-            // Status warnings (more detailed) - skip when kill switch is on (expected behavior)
+            // Tunnel type indicator
+            if self.vpn_status.routing_ok {
+                parts.push("󰒘 Full".to_string());  // All traffic through VPN
+            } else {
+                parts.push("󰒙 Split".to_string()); // Only specific IPs through VPN
+            }
+            
+            // Status warnings - skip when kill switch is on (expected behavior)
             if !self.kill_switch_enabled {
-            if !self.vpn_status.routing_ok {
-                parts.push("⚠ no route".to_string());
-            } else if self.vpn_status.handshake_stale {
-                parts.push("⏳ stale".to_string());
-            } else if !self.vpn_health.can_reach_internet && self.vpn_health.interface_exists {
-                parts.push("⚠ no internet".to_string());
+                if self.vpn_status.handshake_stale {
+                    parts.push("⏳ stale".to_string());
+                } else if !self.vpn_health.can_reach_internet && self.vpn_health.interface_exists {
+                    parts.push("⚠ no internet".to_string());
                 }
             }
             
@@ -1213,6 +1352,10 @@ impl App {
                         self.set_status(format!("Connecting to {}...", tunnel));
                         match crate::vpn::wireguard::connect(tunnel).await {
                             Ok(_) => {
+                                // Save last connected tunnel for auto-reconnect
+                                self.config.last_connected = Some(tunnel.clone());
+                                let _ = self.config.save();
+                                
                                 // Apply tunnel's kill switch setting
                                 let tunnel_ks = self.get_tunnel_info(tunnel)
                                     .map(|t| t.kill_switch)
@@ -1261,6 +1404,10 @@ impl App {
                         let _ = crate::vpn::wireguard::disconnect().await;
                         match crate::vpn::wireguard::connect(tunnel).await {
                             Ok(_) => {
+                                // Save last connected tunnel for auto-reconnect
+                                self.config.last_connected = Some(tunnel.clone());
+                                let _ = self.config.save();
+                                
                                 // Apply new tunnel's kill switch setting
                                 let tunnel_ks = self.get_tunnel_info(tunnel)
                                     .map(|t| t.kill_switch)

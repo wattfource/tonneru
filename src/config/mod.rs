@@ -25,6 +25,14 @@ pub struct AppConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
 
+    /// Last connected tunnel (for auto-reconnect on wake/startup)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_connected: Option<String>,
+
+    /// Auto-reconnect to last tunnel on startup/wake
+    #[serde(default)]
+    pub auto_reconnect: bool,
+
     /// Kill switch enabled
     #[serde(default)]
     pub kill_switch: bool,

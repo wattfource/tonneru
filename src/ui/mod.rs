@@ -67,6 +67,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Popup::None => {}
         Popup::FileBrowser => draw_file_browser(f, app),
         Popup::ConfigPreview => draw_config_preview(f, app),
+        Popup::ManualConfig => draw_manual_config(f, app),
         Popup::Help => draw_help_popup(f),
         Popup::Confirm => draw_confirm_popup(f, app),
     }
@@ -449,9 +450,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("↑↓", "Nav"),
             ("Space", "Connect"),
             ("e", "Edit"),
-            ("f", "Import"),
+            ("n", "New"),
+            ("i", "Import"),
             ("d", "Del"),
-            ("h", "Help"),
         ],
         Section::KillSwitch => vec![
             ("Space", "Toggle"),
@@ -662,6 +663,112 @@ fn draw_config_preview(f: &mut Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(if app.preview_field == 1 { accent() } else { inactive() })),
+    );
+    f.render_widget(buttons, inner[2]);
+}
+
+fn draw_manual_config(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup_area = centered_rect(
+        if area.width < 100 { 95 } else { 80 },
+        if area.height < 35 { 90 } else { 80 },
+        area
+    );
+
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(" 󰈔 Create WireGuard Tunnel ", Style::default().fg(accent())))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent()));
+
+    f.render_widget(block, popup_area);
+
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
+        .split(popup_area);
+
+    // Name input
+    let name_border = if app.preview_field == 0 { accent() } else { inactive() };
+    let name_cursor = if app.preview_field == 0 { "_" } else { "" };
+    let name_input = Paragraph::new(format!("{}{}", app.input_buffer, name_cursor))
+        .style(Style::default().fg(text()))
+        .block(
+            Block::default()
+                .title(Span::styled(" Tunnel Name ", Style::default().fg(if app.preview_field == 0 { accent() } else { header() })))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(name_border)),
+        );
+    f.render_widget(name_input, inner[0]);
+
+    // Config content area
+    let content_border = if app.preview_field == 1 { accent() } else { inactive() };
+    let content_cursor = if app.preview_field == 1 { "█" } else { "" };
+    
+    let content_lines: Vec<Line> = app.config_preview
+        .lines()
+        .map(|line| {
+            if line.starts_with('[') {
+                Line::styled(line, Style::default().fg(accent()).add_modifier(Modifier::BOLD))
+            } else if line.contains('=') {
+                let parts: Vec<&str> = line.splitn(2, '=').collect();
+                if parts.len() == 2 {
+                    Line::from(vec![
+                        Span::styled(parts[0], Style::default().fg(header())),
+                        Span::styled("=", Style::default().fg(text_dim())),
+                        Span::styled(parts[1], Style::default().fg(text())),
+                    ])
+                } else {
+                    Line::styled(line, Style::default().fg(text()))
+                }
+            } else {
+                Line::styled(line, Style::default().fg(text()))
+            }
+        })
+        .collect();
+
+    // Add cursor to last line if in content field
+    let mut display_lines = content_lines;
+    if app.preview_field == 1 {
+        if display_lines.is_empty() {
+            display_lines.push(Line::styled(content_cursor, Style::default().fg(accent())));
+        } else {
+            // Just show the cursor indicator at the end
+            display_lines.push(Line::styled(content_cursor, Style::default().fg(accent())));
+        }
+    }
+
+    let config_edit = Paragraph::new(display_lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(Span::styled(" Paste/Type Config (Tab to switch fields) ", Style::default().fg(if app.preview_field == 1 { accent() } else { header() })))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(content_border)),
+        );
+    f.render_widget(config_edit, inner[1]);
+
+    // Action buttons / instructions
+    let buttons = Paragraph::new(Line::from(vec![
+        Span::styled("  [ ", Style::default().fg(text_dim())),
+        Span::styled("F2 = Save", Style::default().fg(success()).add_modifier(Modifier::BOLD)),
+        Span::styled(" ]  [ ", Style::default().fg(text_dim())),
+        Span::styled("Tab = Switch Field", Style::default().fg(accent())),
+        Span::styled(" ]  [ ", Style::default().fg(text_dim())),
+        Span::styled("Esc = Cancel", Style::default().fg(danger())),
+        Span::styled(" ]  ", Style::default().fg(text_dim())),
+    ]))
+    .alignment(Alignment::Center)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(inactive())),
     );
     f.render_widget(buttons, inner[2]);
 }

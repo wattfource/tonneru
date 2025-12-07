@@ -150,6 +150,50 @@ cmd_killswitch_on() {
     
     log_info "Enabling kill switch for interface: $interface"
     
+    # Collect ALL VPN endpoints from ALL config files
+    # This allows switching between tunnels even with kill switch on
+    local endpoint_rules=""
+    local endpoints_found=0
+    
+    # Parse all WireGuard config files for Endpoint lines
+    if [[ -d "$WG_CONFIG_DIR" ]]; then
+        for conf_file in "$WG_CONFIG_DIR"/*.conf; do
+            [[ -f "$conf_file" ]] || continue
+            
+            # Extract Endpoint = IP:port from config
+            while IFS= read -r line; do
+                # Match "Endpoint = IP:port" or "Endpoint=IP:port"
+                if [[ "$line" =~ ^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+) ]]; then
+                    local ep_ip="${BASH_REMATCH[1]}"
+                    local ep_port="${BASH_REMATCH[2]}"
+                    log_info "Allowing VPN endpoint: $ep_ip:$ep_port (from $(basename "$conf_file"))"
+                    endpoint_rules+="        ip daddr $ep_ip udp dport $ep_port accept"$'\n'
+                    ((endpoints_found++))
+                # Also handle hostname endpoints - resolve them
+                elif [[ "$line" =~ ^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*([a-zA-Z0-9.-]+):([0-9]+) ]]; then
+                    local ep_host="${BASH_REMATCH[1]}"
+                    local ep_port="${BASH_REMATCH[2]}"
+                    # Try to resolve hostname to IP
+                    local ep_ip
+                    ep_ip=$(getent ahosts "$ep_host" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
+                    if [[ -n "$ep_ip" ]]; then
+                        log_info "Allowing VPN endpoint: $ep_ip:$ep_port (resolved from $ep_host)"
+                        endpoint_rules+="        ip daddr $ep_ip udp dport $ep_port accept"$'\n'
+                        ((endpoints_found++))
+                    else
+                        log_info "Could not resolve hostname: $ep_host"
+                    fi
+                fi
+            done < "$conf_file"
+        done
+    fi
+    
+    if [[ $endpoints_found -eq 0 ]]; then
+        log_info "No VPN endpoints found in config files"
+    else
+        log_info "Allowing $endpoints_found VPN endpoint(s)"
+    fi
+    
     # Create nftables rules in a secure temp file
     local temp_file
     temp_file=$(mktemp --tmpdir=/run "tonneru-ks.XXXXXXXXXX.nft")
@@ -163,6 +207,11 @@ table inet $NFT_TABLE {
         iif lo accept
         iif $interface accept
         ct state established,related accept
+        # Allow LAN traffic (private IP ranges)
+        ip saddr 10.0.0.0/8 accept
+        ip saddr 172.16.0.0/12 accept
+        ip saddr 192.168.0.0/16 accept
+        ip saddr 169.254.0.0/16 accept
     }
     chain output {
         type filter hook output priority 0; policy drop;
@@ -172,9 +221,16 @@ table inet $NFT_TABLE {
         # Allow DHCP
         udp dport 67 accept
         udp sport 68 accept
-        # Allow DNS (for initial connection)
+        # Allow LAN traffic (private IP ranges)
+        ip daddr 10.0.0.0/8 accept
+        ip daddr 172.16.0.0/12 accept
+        ip daddr 192.168.0.0/16 accept
+        ip daddr 169.254.0.0/16 accept
+        # Allow DNS (for VPN hostname resolution)
         udp dport 53 accept
         tcp dport 53 accept
+        # Allow traffic to ALL configured VPN endpoints
+$endpoint_rules
     }
     chain forward {
         type filter hook forward priority 0; policy drop;
