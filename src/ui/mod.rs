@@ -287,26 +287,21 @@ fn draw_networks_box(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_tunnels_box(f: &mut Frame, app: &App, area: Rect) {
-    if app.show_config {
-        // Config expanded: split into two columns
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(35),  // Tunnels list
-                Constraint::Percentage(65),  // Config editor
-            ])
-            .split(area);
+    // Always show config panel alongside tunnels list
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(35),  // Tunnels list
+            Constraint::Percentage(65),  // Config viewer
+        ])
+        .split(area);
 
-        draw_tunnels_list(f, app, chunks[0]);
-        draw_config_editor(f, app, chunks[1]);
-    } else {
-        // Config collapsed: just show tunnels list full width
-        draw_tunnels_list(f, app, area);
-    }
+    draw_tunnels_list(f, app, chunks[0]);
+    draw_config_viewer(f, app, chunks[1]);
 }
 
 fn draw_tunnels_list(f: &mut Frame, app: &App, area: Rect) {
-    let is_active = app.section == Section::Tunnels || app.section == Section::TunnelConfig;
+    let is_active = app.section == Section::Tunnels;
     let border_color = if is_active { accent() } else { inactive() };
     let title_style = if is_active {
         Style::default().fg(accent()).add_modifier(Modifier::BOLD)
@@ -319,21 +314,11 @@ fn draw_tunnels_list(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
 
-    // Show different columns based on whether config is expanded
-    let header = if app.show_config {
-        Row::new(vec![
-            Span::styled("", Style::default().fg(header())),
-            Span::styled("Name", Style::default().fg(header())),
-            Span::styled("Status", Style::default().fg(header())),
-        ])
-    } else {
-        Row::new(vec![
-            Span::styled("", Style::default().fg(header())),
-            Span::styled("Name", Style::default().fg(header())),
-            Span::styled("Status", Style::default().fg(header())),
-            Span::styled("(c)onfig", Style::default().fg(header())),
-        ])
-    };
+    let header = Row::new(vec![
+        Span::styled("", Style::default().fg(header())),
+        Span::styled("Name", Style::default().fg(header())),
+        Span::styled("Status", Style::default().fg(header())),
+    ]);
 
     let rows: Vec<Row> = if app.tunnels.is_empty() {
         vec![
@@ -368,48 +353,27 @@ fn draw_tunnels_list(f: &mut Frame, app: &App, area: Rect) {
                     ("󰒙", text_dim(), "DOWN", text_dim())
                 };
 
-                let row_style = if i == app.selected_tunnel && (app.section == Section::Tunnels || app.section == Section::TunnelConfig) {
+                let row_style = if i == app.selected_tunnel && app.section == Section::Tunnels {
                     Style::default().bg(bg_selected())
                 } else {
                     Style::default()
                 };
 
-                if app.show_config {
-                    // Compact view when config is expanded
-                    Row::new(vec![
-                        Span::styled(icon, Style::default().fg(icon_color)),
-                        Span::styled(&tunnel.name, Style::default().fg(text())),
-                        Span::styled(status, Style::default().fg(status_color)),
-                    ])
-                    .style(row_style)
-                } else {
-                    // Full view with config column
-                    Row::new(vec![
-                        Span::styled(icon, Style::default().fg(icon_color)),
-                        Span::styled(&tunnel.name, Style::default().fg(text())),
-                        Span::styled(status, Style::default().fg(status_color)),
-                        Span::styled("▸", Style::default().fg(accent())),  // Indicator to expand
-                    ])
-                    .style(row_style)
-                }
+                Row::new(vec![
+                    Span::styled(icon, Style::default().fg(icon_color)),
+                    Span::styled(&tunnel.name, Style::default().fg(text())),
+                    Span::styled(status, Style::default().fg(status_color)),
+                ])
+                .style(row_style)
             })
             .collect()
     };
 
-    let widths = if app.show_config {
-        vec![
-            Constraint::Length(3),
-            Constraint::Percentage(60),
-            Constraint::Percentage(35),
-        ]
-    } else {
-        vec![
-            Constraint::Length(3),
-            Constraint::Percentage(45),
-            Constraint::Percentage(35),
-            Constraint::Percentage(15),
-        ]
-    };
+    let widths = vec![
+        Constraint::Length(3),
+        Constraint::Percentage(60),
+        Constraint::Percentage(35),
+    ];
 
     let table = Table::new(rows, widths)
         .header(header.style(Style::default()))
@@ -418,26 +382,18 @@ fn draw_tunnels_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn draw_config_editor(f: &mut Frame, app: &App, area: Rect) {
-    let is_active = app.section == Section::TunnelConfig;
-    let border_color = if is_active { accent() } else { inactive() };
-    
-    let modified_indicator = if app.tunnel_config_modified { " *" } else { "" };
-    let title = format!(" Config{} ", modified_indicator);
-    
-    let title_style = if is_active {
-        Style::default().fg(accent()).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(inactive())
-    };
+fn draw_config_viewer(f: &mut Frame, app: &App, area: Rect) {
+    // Config viewer is always visible but not separately active
+    let border_color = inactive();
+    let title_style = Style::default().fg(inactive());
 
     let block = Block::default()
-        .title(Span::styled(title, title_style))
+        .title(Span::styled(" Config ", title_style))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
 
     if app.tunnels.is_empty() {
-        let help = Paragraph::new("Select a tunnel to view its configuration")
+        let help = Paragraph::new("No tunnel selected")
             .style(Style::default().fg(text_dim()))
             .block(block);
         f.render_widget(help, area);
@@ -477,42 +433,10 @@ fn draw_config_editor(f: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false });
 
     f.render_widget(content, area);
-
-    // Show blinking cursor when active (at first visible line, after line number)
-    if is_active && !lines.is_empty() {
-        // Position cursor at beginning of first visible line's content
-        // area.x + 1 (border) + 4 (line number "XXX ")
-        let cursor_x = area.x + 5;
-        let cursor_y = area.y + 1;
-        f.set_cursor_position((cursor_x, cursor_y));
-    }
-
-    // Show hint at bottom if active
-    if is_active {
-        let hint_area = Rect {
-            x: area.x + 1,
-            y: area.y + area.height - 1,
-            width: area.width.saturating_sub(2),
-            height: 1,
-        };
-        let hint = Paragraph::new(Line::from(vec![
-            Span::styled("Ctrl+S", Style::default().fg(accent())),
-            Span::styled(" save  ", Style::default().fg(text_dim())),
-            Span::styled("Esc", Style::default().fg(accent())),
-            Span::styled(" discard", Style::default().fg(text_dim())),
-        ]));
-        f.render_widget(hint, hint_area);
-    }
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints: Vec<(&str, &str)> = match app.section {
-        Section::TunnelConfig => vec![
-            ("Ctrl+S", "Save"),
-            ("Esc", "Discard"),
-            ("↑/↓", "Scroll"),
-            ("Tab", "Next"),
-        ],
         Section::Networks => vec![
             ("↑↓", "Nav"),
             ("r", "Rule"),
@@ -524,7 +448,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Section::Tunnels => vec![
             ("↑↓", "Nav"),
             ("Space", "Connect"),
-            ("c", "Config"),
+            ("e", "Edit"),
             ("f", "Import"),
             ("d", "Del"),
             ("h", "Help"),

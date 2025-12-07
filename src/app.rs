@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use std::time::Instant;
 
 use crate::config::{AppConfig, NetworkRule, TunnelInfo};
@@ -33,7 +33,6 @@ const COUNTDOWN_SECONDS: u64 = 4;
 pub enum Section {
     Networks,
     Tunnels,
-    TunnelConfig,  // Config editor panel
     KillSwitch,    // Internet kill switch box
 }
 
@@ -83,13 +82,9 @@ pub struct App {
     pub browser_entries: Vec<BrowserEntry>,
     pub browser_selected: usize,
 
-    // Tunnel config editor (right side of tunnels box)
+    // Tunnel config viewer (right side of tunnels box)
     pub tunnel_config_content: String,
-    pub tunnel_config_original: String,  // To detect changes
-    pub tunnel_config_cursor: usize,     // Cursor position in text
     pub tunnel_config_scroll: usize,     // Scroll offset for display
-    pub tunnel_config_modified: bool,    // Has unsaved changes
-    pub show_config: bool,               // Whether config panel is expanded
 
     // Pending change countdown (3 second delay before applying rule/tunnel changes)
     pub pending_change: Option<PendingChange>,
@@ -160,11 +155,7 @@ impl App {
             browser_selected: 0,
 
             tunnel_config_content: String::new(),
-            tunnel_config_original: String::new(),
-            tunnel_config_cursor: 0,
             tunnel_config_scroll: 0,
-            tunnel_config_modified: false,
-            show_config: false,
 
             pending_change: None,
             countdown_start: None,
@@ -200,6 +191,9 @@ impl App {
                 }
             }
         }
+
+        // Load config for the initially selected tunnel
+        app.load_selected_tunnel_config().await;
 
         Ok(app)
     }
@@ -242,66 +236,16 @@ impl App {
             // Use the helper to read config (passwordless sudo)
             match crate::vpn::run_helper(&["config-read", &tunnel_name]).await {
                 Ok(output) if output.status.success() => {
-                    let content = String::from_utf8_lossy(&output.stdout).to_string();
-                    self.tunnel_config_content = content.clone();
-                    self.tunnel_config_original = content;
-                    self.tunnel_config_cursor = 0;
+                    self.tunnel_config_content = String::from_utf8_lossy(&output.stdout).to_string();
                     self.tunnel_config_scroll = 0;
-                    self.tunnel_config_modified = false;
                 }
                 _ => {
                     self.tunnel_config_content = "# Unable to load config\n# Check permissions".to_string();
-                    self.tunnel_config_original = self.tunnel_config_content.clone();
-                    self.tunnel_config_modified = false;
                 }
             }
         } else {
             self.tunnel_config_content.clear();
-            self.tunnel_config_original.clear();
-            self.tunnel_config_modified = false;
         }
-    }
-
-    /// Save the edited tunnel config
-    pub async fn save_tunnel_config(&mut self) -> Result<()> {
-        if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
-            let tunnel_name = tunnel.name.clone();
-            let was_connected = tunnel.connected;
-            
-            // Disconnect first if connected
-            if was_connected {
-                let _ = crate::vpn::wireguard::disconnect().await;
-                self.set_status(format!("Disconnecting {} to apply changes...", tunnel_name));
-            }
-
-            // Save using the add_profile function (handles sudo)
-            match crate::vpn::wireguard::add_profile(&tunnel_name, &self.tunnel_config_content).await {
-                Ok(_) => {
-                    self.tunnel_config_original = self.tunnel_config_content.clone();
-                    self.tunnel_config_modified = false;
-                    
-                    // Reconnect if was connected
-                    if was_connected {
-                        match crate::vpn::wireguard::connect(&tunnel_name).await {
-                            Ok(_) => {
-                                self.set_status(format!("Config saved & {} reconnected", tunnel_name));
-                            }
-                            Err(e) => {
-                                self.set_status(format!("Saved but reconnect failed: {}", e));
-                            }
-                        }
-                    } else {
-                        self.set_status(format!("Config saved for {}", tunnel_name));
-                    }
-                    
-                    self.refresh().await?;
-                }
-                Err(e) => {
-                    self.set_status(format!("Save failed: {}", e));
-                }
-            }
-        }
-        Ok(())
     }
 
     pub async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -315,11 +259,6 @@ impl App {
     }
 
     async fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
-        // Handle TunnelConfig editing separately when config is expanded
-        if self.section == Section::TunnelConfig && self.show_config {
-            return self.handle_tunnel_config_key(key).await;
-        }
-
         // Escape cancels pending change
         if key.code == KeyCode::Esc && self.pending_change.is_some() {
             self.cancel_pending_change();
@@ -334,11 +273,6 @@ impl App {
                     Section::Networks => Section::Tunnels,
                     Section::Tunnels => Section::KillSwitch,
                     Section::KillSwitch => Section::Networks,
-                    Section::TunnelConfig => {
-                        // Collapse config when tabbing out
-                        self.show_config = false;
-                        Section::KillSwitch
-                    }
                 };
             }
             KeyCode::BackTab => {
@@ -346,11 +280,6 @@ impl App {
                     Section::Networks => Section::KillSwitch,
                     Section::Tunnels => Section::Networks,
                     Section::KillSwitch => Section::Tunnels,
-                    Section::TunnelConfig => {
-                        // Collapse config when tabbing out
-                        self.show_config = false;
-                        Section::Tunnels
-                    }
                 };
             }
 
@@ -373,12 +302,10 @@ impl App {
                 }
             }
 
-            // Expand config panel (only in Tunnels section)
-            KeyCode::Char('c') => {
+            // Edit config in external editor (only in Tunnels section)
+            KeyCode::Char('e') => {
                 if self.section == Section::Tunnels && !self.tunnels.is_empty() {
-                    self.load_selected_tunnel_config().await;
-                    self.show_config = true;
-                    self.section = Section::TunnelConfig;
+                    self.edit_tunnel_config_external().await?;
                 }
             }
 
@@ -408,74 +335,6 @@ impl App {
             
             // Help (? or h)
             KeyCode::Char('?') | KeyCode::Char('h') => self.popup = Popup::Help,
-
-            _ => {}
-        }
-        Ok(())
-    }
-
-    async fn handle_tunnel_config_key(&mut self, key: KeyEvent) -> Result<()> {
-        // Ctrl+S to save
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            self.save_tunnel_config().await?;
-            return Ok(());
-        }
-
-        match key.code {
-            // Tab/BackTab to collapse config and navigate away
-            KeyCode::Tab => {
-                self.show_config = false;
-                self.section = Section::Networks;
-            }
-            KeyCode::BackTab => {
-                self.show_config = false;
-                self.section = Section::Tunnels;
-            }
-            
-            // Escape to discard changes, collapse, and go back
-            KeyCode::Esc => {
-                if self.tunnel_config_modified {
-                    // Reload original
-                    self.tunnel_config_content = self.tunnel_config_original.clone();
-                    self.tunnel_config_modified = false;
-                    self.set_status("Changes discarded");
-                }
-                self.show_config = false;
-                self.section = Section::Tunnels;
-            }
-
-            // Arrow keys for navigation
-            KeyCode::Up => {
-                if self.tunnel_config_scroll > 0 {
-                    self.tunnel_config_scroll -= 1;
-                }
-            }
-            KeyCode::Down => {
-                let lines: Vec<&str> = self.tunnel_config_content.lines().collect();
-                if self.tunnel_config_scroll < lines.len().saturating_sub(1) {
-                    self.tunnel_config_scroll += 1;
-                }
-            }
-
-            // Enter to add newline
-            KeyCode::Enter => {
-                self.tunnel_config_content.push('\n');
-                self.tunnel_config_modified = true;
-            }
-
-            // Backspace to delete
-            KeyCode::Backspace => {
-                if !self.tunnel_config_content.is_empty() {
-                    self.tunnel_config_content.pop();
-                    self.tunnel_config_modified = true;
-                }
-            }
-
-            // Character input
-            KeyCode::Char(c) => {
-                self.tunnel_config_content.push(c);
-                self.tunnel_config_modified = true;
-            }
 
             _ => {}
         }
@@ -526,13 +385,6 @@ impl App {
                     }
                 }
             }
-            Section::TunnelConfig => {
-                // Scroll down in config editor
-                let lines: Vec<&str> = self.tunnel_config_content.lines().collect();
-                if self.tunnel_config_scroll < lines.len().saturating_sub(1) {
-                    self.tunnel_config_scroll += 1;
-                }
-            }
             Section::KillSwitch => {
                 // No navigation in kill switch box (it's a single toggle)
             }
@@ -556,16 +408,59 @@ impl App {
                     }
                 }
             }
-            Section::TunnelConfig => {
-                // Scroll up in config editor
-                if self.tunnel_config_scroll > 0 {
-                    self.tunnel_config_scroll -= 1;
-                }
-            }
             Section::KillSwitch => {
                 // No navigation in kill switch box (it's a single toggle)
             }
         }
+    }
+
+    /// Edit tunnel config in external editor (sudoedit)
+    async fn edit_tunnel_config_external(&mut self) -> Result<()> {
+        if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
+            let tunnel_name = tunnel.name.clone();
+            let was_connected = self.vpn_status.connected 
+                && self.vpn_status.interface.as_deref() == Some(&tunnel_name);
+            let config_path = format!("/etc/wireguard/{}.conf", tunnel_name);
+            
+            self.set_status(format!("Opening {} in editor (sudo)...", tunnel_name));
+            
+            // Use sudoedit to properly edit root-owned config files
+            // This copies the file to a temp location, opens $EDITOR, then copies back
+            let result = std::process::Command::new("sudoedit")
+                .arg(&config_path)
+                .spawn();
+            
+            match result {
+                Ok(mut child) => {
+                    // Wait for editor to close
+                    let _ = child.wait();
+                    
+                    // Reload the config content
+                    self.load_selected_tunnel_config().await;
+                    
+                    // If tunnel was connected, reconnect to apply changes
+                    if was_connected {
+                        self.set_status(format!("Reconnecting {} to apply changes...", tunnel_name));
+                        let _ = crate::vpn::wireguard::disconnect().await;
+                        match crate::vpn::wireguard::connect(&tunnel_name).await {
+                            Ok(_) => {
+                                self.set_status(format!("Config updated & {} reconnected", tunnel_name));
+                            }
+                            Err(e) => {
+                                self.set_status(format!("Reconnect failed: {}", e));
+                            }
+                        }
+                        self.refresh().await?;
+                    } else {
+                        self.set_status(format!("Config reloaded for {}", tunnel_name));
+                    }
+                }
+                Err(e) => {
+                    self.set_status(format!("Failed to open editor: {}", e));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Connect to the selected tunnel now (one-time)
@@ -995,14 +890,6 @@ impl App {
             Section::Tunnels => {
                 if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
                     self.input_buffer = tunnel.name.clone(); // Store name for confirm
-                    self.set_status(format!("Delete '{}'? (y/n)", tunnel.name));
-                    self.popup = Popup::Confirm;
-                }
-            }
-            Section::TunnelConfig => {
-                // Same as Tunnels - delete the selected tunnel
-                if let Some(tunnel) = self.tunnels.get(self.selected_tunnel) {
-                    self.input_buffer = tunnel.name.clone();
                     self.set_status(format!("Delete '{}'? (y/n)", tunnel.name));
                     self.popup = Popup::Confirm;
                 }
