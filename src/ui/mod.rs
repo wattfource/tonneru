@@ -478,25 +478,13 @@ fn draw_config_editor(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(content, area);
 
-    // Show blinking cursor when active
-    if is_active {
-        // Calculate cursor position (always at end of content)
-        let total_lines = lines.len();
-        let last_line = lines.last().unwrap_or(&"");
-        let cursor_line = if total_lines == 0 { 0 } else { total_lines - 1 };
-        
-        // Check if cursor line is visible
-        if cursor_line >= start && cursor_line < start + inner_height {
-            let visible_line_idx = cursor_line - start;
-            // Position: area.x + 1 (border) + 4 (line number "XXX ") + last_line.len()
-            let cursor_x = area.x + 1 + 4 + last_line.len() as u16;
-            let cursor_y = area.y + 1 + visible_line_idx as u16;
-            
-            // Only show cursor if it's within bounds
-            if cursor_x < area.x + area.width - 1 {
-                f.set_cursor_position((cursor_x, cursor_y));
-            }
-        }
+    // Show blinking cursor when active (at first visible line, after line number)
+    if is_active && !lines.is_empty() {
+        // Position cursor at beginning of first visible line's content
+        // area.x + 1 (border) + 4 (line number "XXX ")
+        let cursor_x = area.x + 5;
+        let cursor_y = area.y + 1;
+        f.set_cursor_position((cursor_x, cursor_y));
     }
 
     // Show hint at bottom if active
