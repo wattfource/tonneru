@@ -1,0 +1,24 @@
+name: Deploy to AUR
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  aur:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
+        with:
+          pkgname: tonneru
+          pkgbuild: ./packaging/aur/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: Update to ${{ github.event.release.tag_name }}
+          ssh_keyscan_types: rsa,dsa,ecdsa,ed25519
+

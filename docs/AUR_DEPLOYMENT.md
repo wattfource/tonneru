@@ -32,17 +32,28 @@ Then:
 3. Paste your public key in the "SSH Public Key" field
 4. Click "Update"
 
-### 3. Configure SSH for AUR
+## 🤖 Option 1: Automatic Deployment (Recommended)
 
-Add to `~/.ssh/config`:
+This project is configured with GitHub Actions to deploy automatically when you create a release.
 
-```
-Host aur.archlinux.org
-    User aur
-    IdentityFile ~/.ssh/id_ed25519
-```
+### Setup (One-Time)
 
-## 🚀 First-Time Publishing
+1.  **Add Secrets to GitHub Repository:**
+    Go to Settings > Secrets and variables > Actions > New repository secret
+
+    *   `AUR_SSH_PRIVATE_KEY`: Your private SSH key (content of `~/.ssh/id_ed25519`)
+    *   `AUR_USERNAME`: Your AUR username
+    *   `AUR_EMAIL`: Your AUR email address
+
+2.  **Create a Release:**
+    When you are ready to publish, create a new Release on GitHub with a tag (e.g., `v0.1.0`).
+
+    The workflow will automatically:
+    *   Checkout the code
+    *   Update the AUR package with the new version
+    *   Push to AUR
+
+## 🛠️ Option 2: Manual Deployment
 
 ### Step 1: Push Source Code to GitHub
 
@@ -63,7 +74,17 @@ git remote add origin git@github.com:WattForce/tonneru.git
 git push -u origin main --tags
 ```
 
-### Step 2: Clone AUR Package Repository
+### Step 2: Configure SSH for AUR
+
+Add to `~/.ssh/config`:
+
+```
+Host aur.archlinux.org
+    User aur
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+### Step 3: Clone AUR Package Repository
 
 ```bash
 # This creates an empty repo for your new package
@@ -73,7 +94,7 @@ git clone ssh://aur@aur.archlinux.org/tonneru.git ~/aur-tonneru
 # If it doesn't exist, it creates an empty repo
 ```
 
-### Step 3: Copy AUR Files
+### Step 4: Copy AUR Files
 
 ```bash
 cd ~/aur-tonneru
@@ -84,7 +105,7 @@ cp /path/to/tonneru/packaging/aur/.SRCINFO .
 cp /path/to/tonneru/packaging/aur/tonneru.install .
 ```
 
-### Step 4: Verify PKGBUILD
+### Step 5: Verify PKGBUILD
 
 ```bash
 # Validate the PKGBUILD
@@ -98,7 +119,7 @@ makepkg -si
 extra-x86_64-build
 ```
 
-### Step 5: Push to AUR
+### Step 6: Push to AUR
 
 ```bash
 cd ~/aur-tonneru
@@ -129,7 +150,7 @@ git tag vX.Y.Z
 git push origin main --tags
 ```
 
-### Step 2: Update AUR
+### Step 2: Update AUR (Manual Method)
 
 ```bash
 cd ~/aur-tonneru
@@ -244,4 +265,3 @@ If you're helping Sean with AUR deployment:
 4. **Maintainer**: Sean should be listed as maintainer in PKGBUILD
 
 Contact: me@seanfournier.com | GitHub: @WattForce
-
