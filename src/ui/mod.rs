@@ -236,7 +236,9 @@ fn draw_networks_box(f: &mut Frame, app: &App, area: Rect) {
                 let connected_indicator = if network.connected { " ●" } else { "" };
 
                 let row_style = if i == app.selected_network && is_active {
-                    Style::default().bg(bg_selected())
+                    Style::default()
+                        .bg(bg_selected())
+                        .add_modifier(Modifier::REVERSED) // Add reverse modifier for better visibility
                 } else {
                     Style::default()
                 };
@@ -355,7 +357,9 @@ fn draw_tunnels_list(f: &mut Frame, app: &App, area: Rect) {
                 };
 
                 let row_style = if i == app.selected_tunnel && app.section == Section::Tunnels {
-                    Style::default().bg(bg_selected())
+                    Style::default()
+                        .bg(bg_selected())
+                        .add_modifier(Modifier::REVERSED)
                 } else {
                     Style::default()
                 };
@@ -531,7 +535,9 @@ fn draw_file_browser(f: &mut Frame, app: &App) {
                 let icon_color = if entry.is_dir { accent() } else { success() };
                 
                 let row_style = if i == app.browser_selected {
-                    Style::default().bg(bg_selected())
+                    Style::default()
+                        .bg(bg_selected())
+                        .add_modifier(Modifier::REVERSED)
                 } else {
                     Style::default()
                 };

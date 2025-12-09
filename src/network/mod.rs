@@ -750,3 +750,46 @@ fn is_valid_ipv4(s: &str) -> bool {
     
     true
 }
+
+/// Forget/Delete a known network connection
+pub async fn forget_network(network: &NetworkInfo) -> Result<()> {
+    use std::process::Command;
+    
+    // 1. Try to forget using iwctl (if it's a wifi network)
+    if network.network_type == "wifi" {
+        if let Some(ssid) = &network.ssid {
+            tracing::info!("Attempting to forget network '{}' using iwctl", ssid);
+            let output = Command::new("iwctl")
+                .args(["known-networks", ssid, "forget"])
+                .output();
+                
+            if let Ok(output) = output {
+                if output.status.success() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    
+    // 2. Try to forget using nmcli (NetworkManager)
+    // Works for both wifi and ethernet if managed by NM
+    let id_to_delete = if let Some(ssid) = &network.ssid {
+        ssid
+    } else {
+        &network.name
+    };
+    
+    tracing::info!("Attempting to delete connection '{}' using nmcli", id_to_delete);
+    let output = Command::new("nmcli")
+        .args(["connection", "delete", id_to_delete])
+        .output();
+        
+    if let Ok(output) = output {
+        if output.status.success() {
+            return Ok(());
+        }
+    }
+    
+    // If we get here, we couldn't delete it
+    anyhow::bail!("Could not forget network '{}'. Is it a known network?", network.name)
+}

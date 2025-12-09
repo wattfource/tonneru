@@ -1029,13 +1029,11 @@ impl App {
                 }
             }
             Section::Networks => {
-                // Remove rule for this network
+                // Forget network entirely
                 if let Some(network) = self.networks.get(self.selected_network) {
-                    let identifier = network.identifier();
-                    self.network_rules.retain(|r| r.identifier != identifier);
-                    self.config.network_rules = self.network_rules.clone();
-                    self.config.save()?;
-                    self.set_status(format!("Rule removed for {}", network.name));
+                    self.input_buffer = network.name.clone(); // Store name for confirm
+                    self.set_status(format!("Forget network '{}'? (y/n)", network.name));
+                    self.popup = Popup::Confirm;
                 }
             }
             Section::KillSwitch => {
@@ -1046,6 +1044,33 @@ impl App {
     }
 
     async fn confirm_action(&mut self) -> Result<()> {
+        // Delete the tunnel OR forget network
+        if self.section == Section::Networks {
+             let network_name = self.input_buffer.clone();
+             self.input_buffer.clear();
+             
+             if let Some(network) = self.networks.iter().find(|n| n.name == network_name) {
+                 // 1. Remove rules
+                 let identifier = network.identifier();
+                 self.network_rules.retain(|r| r.identifier != identifier);
+                 self.config.network_rules = self.network_rules.clone();
+                 self.config.save()?;
+                 
+                 // 2. Forget network from system
+                 match crate::network::forget_network(network).await {
+                     Ok(_) => {
+                         self.set_status(format!("Forgot network '{}'", network_name));
+                         self.refresh().await?;
+                     }
+                     Err(e) => {
+                         self.set_status(format!("Error: {}", e));
+                     }
+                 }
+             }
+             return Ok(());
+        }
+
+        // Tunnels section handling
         let tunnel_name = self.input_buffer.clone();
         self.input_buffer.clear();
         
