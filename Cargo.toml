@@ -1,9 +1,9 @@
 [package]
 name = "tonneru"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Sean Fournier <me@seanfournier.com>"]
-description = "A WireGuard VPN manager for Omarchy (Arch Linux)"
+description = "A TUI-based WireGuard manager with network automation and kill switch"
 license = "WTFPL"
 repository = "https://github.com/WattForce/tonneru"
 homepage = "https://github.com/WattForce/tonneru"
