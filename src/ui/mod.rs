@@ -238,7 +238,8 @@ fn draw_networks_box(f: &mut Frame, app: &App, area: Rect) {
                 let row_style = if i == app.selected_network && is_active {
                     Style::default()
                         .bg(bg_selected())
-                        .add_modifier(Modifier::REVERSED) // Add reverse modifier for better visibility
+                        .fg(text()) // Ensure text is visible against selection bg
+                        // .add_modifier(Modifier::REVERSED) // Removed reversed modifier to match netpala style more closely
                 } else {
                     Style::default()
                 };
@@ -359,7 +360,8 @@ fn draw_tunnels_list(f: &mut Frame, app: &App, area: Rect) {
                 let row_style = if i == app.selected_tunnel && app.section == Section::Tunnels {
                     Style::default()
                         .bg(bg_selected())
-                        .add_modifier(Modifier::REVERSED)
+                        .fg(text())
+                        // .add_modifier(Modifier::REVERSED)
                 } else {
                     Style::default()
                 };
@@ -537,7 +539,8 @@ fn draw_file_browser(f: &mut Frame, app: &App) {
                 let row_style = if i == app.browser_selected {
                     Style::default()
                         .bg(bg_selected())
-                        .add_modifier(Modifier::REVERSED)
+                        .fg(text())
+                        // .add_modifier(Modifier::REVERSED)
                 } else {
                     Style::default()
                 };
