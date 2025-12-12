@@ -75,9 +75,18 @@ async fn main() -> Result<()> {
 async fn print_status() -> Result<()> {
     let status = vpn::wireguard::get_status().await?;
     
-    // Determine class for waybar (uses filled/outline icons, not colors)
-    // 󰌾 = filled shield (active), 󰒖 = outline shield (inactive)
-    let class = if status.connected { "connected" } else { "disconnected" };
+    // Determine effective state (connected AND fresh handshake)
+    let is_effectively_connected = status.connected && !status.handshake_stale;
+    
+    // Determine class for waybar
+    // If connected but stale, we show as degraded/disconnected so user notices
+    let class = if is_effectively_connected { 
+        "connected" 
+    } else if status.connected {
+        "degraded" // Connected but stale
+    } else { 
+        "disconnected" 
+    };
     
     // Build tooltip with health info
     let tooltip = if status.connected {
@@ -98,7 +107,7 @@ async fn print_status() -> Result<()> {
             lines.push("⚠ Routing not configured".to_string());
         }
         if status.handshake_stale {
-            lines.push("⏳ Handshake stale".to_string());
+            lines.push("⏳ Handshake stale (connection lost?)".to_string());
         }
         
         lines.join("\n")
@@ -107,7 +116,6 @@ async fn print_status() -> Result<()> {
     };
     
     // Output waybar-compatible JSON
-    // Icon is handled by waybar format-icons based on "alt" field
     let output = serde_json::json!({
         "text": if status.connected { 
             status.interface.as_deref().unwrap_or("VPN").to_string()
@@ -116,11 +124,11 @@ async fn print_status() -> Result<()> {
         },
         "tooltip": tooltip,
         "class": class,
-        "alt": if status.connected { "connected" } else { "disconnected" },
+        "alt": class, // Use class as alt text for format-icons
         "connected": status.connected,
         "interface": status.interface,
         "endpoint": status.endpoint,
-        "healthy": status.connected && status.routing_ok && !status.handshake_stale
+        "healthy": is_effectively_connected && status.routing_ok
     });
     
     println!("{}", serde_json::to_string(&output)?);

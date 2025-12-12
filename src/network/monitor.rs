@@ -139,25 +139,33 @@ async fn handle_resume(config: &AppConfig, state: &mut MonitorState) {
             .find(|r| r.identifier == network.identifier());
         
         match rule {
-            Some(r) if r.always_vpn || r.session_vpn => {
+            Some(r) if r.always_vpn => {
                 let expected_tunnel = r.tunnel_name.as_ref().or(config.default_profile.as_ref());
                 
                 // Should be connected to VPN
                 if let Some(tunnel) = expected_tunnel {
+                    // Check if we need to reconnect
                     if !vpn_status.connected || vpn_status.interface.as_ref() != Some(tunnel) {
-                        // VPN is not connected or wrong tunnel - reconnect
-                        tracing::info!("Reconnecting VPN after resume: {}", tunnel);
+                        tracing::info!("Reconnecting VPN after resume (Always rule): {}", tunnel);
+                        reconnect_vpn(tunnel, state).await;
+                    } else if !verify_vpn_health(&vpn_status).await {
+                        // Connected but unhealthy
+                        tracing::warn!("VPN connected but unhealthy after resume - reconnecting");
                         reconnect_vpn(tunnel, state).await;
                     } else {
-                        // VPN is connected to right tunnel - verify it's working
-                        if !verify_vpn_health(&vpn_status).await {
-                            tracing::warn!("VPN connected but not healthy - reconnecting");
-                            reconnect_vpn(tunnel, state).await;
-                        } else {
-                            tracing::info!("VPN {} verified working after resume", tunnel);
-                            notify_resume_ok(tunnel);
-                        }
+                        tracing::info!("VPN {} verified working after resume", tunnel);
+                        notify_resume_ok(tunnel);
                     }
+                }
+            }
+            Some(r) if r.session_vpn => {
+                // User requested: Session ends on sleep/hibernation
+                tracing::info!("Ending Session VPN after resume (sleep ended session)");
+                // Clear the session flag so it doesn't try to reconnect later
+                clear_session_rule(&network.identifier()).await;
+                if vpn_status.connected {
+                    let _ = wireguard::disconnect().await;
+                    notify_session_ended();
                 }
             }
             Some(r) if r.never_vpn => {
