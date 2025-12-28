@@ -1,0 +1,471 @@
+#!/bin/bash
+# tonneru-sudo - Secure privileged helper for tonneru VPN manager
+# 
+# This script is the ONLY entry point for privileged operations.
+# It validates all input before executing any commands.
+#
+# Install: /usr/lib/tonneru/tonneru-sudo (mode 0755, root:root)
+# Sudoers: %tonneru ALL=(ALL) NOPASSWD: /usr/lib/tonneru/tonneru-sudo
+#
+# Security features:
+# - Strict input validation (whitelist approach)
+# - No wildcards or glob patterns
+# - Secure temp file handling
+# - All operations logged to journal
+# - Fails closed on any error
+
+set -euo pipefail
+
+# Constants
+readonly SCRIPT_NAME="tonneru-sudo"
+readonly WG_CONFIG_DIR="/etc/wireguard"
+readonly NFT_TABLE="tonneru_killswitch"
+readonly VALID_NAME_PATTERN='^[a-zA-Z0-9][a-zA-Z0-9_-]{0,30}$'
+
+# Logging
+log_info() {
+    logger -t "$SCRIPT_NAME" -p user.info "$*"
+}
+
+log_error() {
+    logger -t "$SCRIPT_NAME" -p user.error "$*"
+    printf '%s\n' "Error: $*" >&2
+}
+
+log_security() {
+    logger -t "$SCRIPT_NAME" -p auth.warning "SECURITY: $*"
+}
+
+# Validate profile/interface name
+# Only allows: alphanumeric, underscore, hyphen
+# Must start with alphanumeric, max 31 chars
+validate_name() {
+    local name="$1"
+    local context="$2"
+    
+    if [[ -z "$name" ]]; then
+        log_error "$context name cannot be empty"
+        return 1
+    fi
+    
+    if [[ ${#name} -gt 31 ]]; then
+        log_error "$context name too long (max 31 chars): $name"
+        return 1
+    fi
+    
+    if ! [[ "$name" =~ $VALID_NAME_PATTERN ]]; then
+        log_security "Invalid $context name rejected: $name"
+        log_error "Invalid $context name (alphanumeric, underscore, hyphen only)"
+        return 1
+    fi
+    
+    # Additional safety: reject names that could be path components
+    if [[ "$name" == "." || "$name" == ".." || "$name" == *"/"* ]]; then
+        log_security "Path traversal attempt rejected: $name"
+        log_error "Invalid $context name"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Validate that a WireGuard config file exists
+validate_config_exists() {
+    local name="$1"
+    local config_path="$WG_CONFIG_DIR/$name.conf"
+    
+    if [[ ! -f "$config_path" ]]; then
+        log_error "Config file does not exist: $name"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Get currently active WireGuard interface
+get_active_interface() {
+    /usr/bin/wg show interfaces 2>/dev/null | head -n1
+}
+
+# Command: connect <profile>
+cmd_connect() {
+    local profile="${1:-}"
+    
+    if ! validate_name "$profile" "profile"; then
+        return 1
+    fi
+    
+    if ! validate_config_exists "$profile"; then
+        return 1
+    fi
+    
+    log_info "Connecting to WireGuard profile: $profile"
+    /usr/bin/wg-quick up "$profile"
+}
+
+# Command: disconnect [interface]
+cmd_disconnect() {
+    local interface="${1:-}"
+    
+    # If no interface specified, get the active one
+    if [[ -z "$interface" ]]; then
+        interface=$(get_active_interface)
+        if [[ -z "$interface" ]]; then
+            log_info "No active WireGuard interface to disconnect"
+            return 0
+        fi
+    fi
+    
+    if ! validate_name "$interface" "interface"; then
+        return 1
+    fi
+    
+    log_info "Disconnecting WireGuard interface: $interface"
+    /usr/bin/wg-quick down "$interface" 2>/dev/null || true
+}
+
+# Command: status
+cmd_status() {
+    /usr/bin/wg show
+}
+
+# Command: status-interface <interface>
+cmd_status_interface() {
+    local interface="${1:-}"
+    
+    if ! validate_name "$interface" "interface"; then
+        return 1
+    fi
+    
+    /usr/bin/wg show "$interface"
+}
+
+# Command: killswitch-on <interface>
+cmd_killswitch_on() {
+    local interface="${1:-}"
+    
+    if ! validate_name "$interface" "interface"; then
+        return 1
+    fi
+    
+    log_info "Enabling kill switch for interface: $interface"
+    
+    # Collect ALL VPN endpoints from ALL config files
+    # This allows switching between tunnels even with kill switch on
+    local endpoint_rules=""
+    local endpoints_found=0
+    
+    # Parse all WireGuard config files for Endpoint lines
+    if [[ -d "$WG_CONFIG_DIR" ]]; then
+        for conf_file in "$WG_CONFIG_DIR"/*.conf; do
+            [[ -f "$conf_file" ]] || continue
+            
+            # Extract Endpoint = IP:port from config
+            while IFS= read -r line; do
+                # Match "Endpoint = IP:port" or "Endpoint=IP:port"
+                if [[ "$line" =~ ^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+) ]]; then
+                    local ep_ip="${BASH_REMATCH[1]}"
+                    local ep_port="${BASH_REMATCH[2]}"
+                    log_info "Allowing VPN endpoint: $ep_ip:$ep_port (from $(basename "$conf_file"))"
+                    endpoint_rules+="        ip daddr $ep_ip udp dport $ep_port accept"$'\n'
+                    ((endpoints_found++))
+                # Also handle hostname endpoints - resolve them
+                elif [[ "$line" =~ ^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*([a-zA-Z0-9.-]+):([0-9]+) ]]; then
+                    local ep_host="${BASH_REMATCH[1]}"
+                    local ep_port="${BASH_REMATCH[2]}"
+                    # Try to resolve hostname to IP
+                    local ep_ip
+                    ep_ip=$(getent ahosts "$ep_host" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
+                    if [[ -n "$ep_ip" ]]; then
+                        log_info "Allowing VPN endpoint: $ep_ip:$ep_port (resolved from $ep_host)"
+                        endpoint_rules+="        ip daddr $ep_ip udp dport $ep_port accept"$'\n'
+                        ((endpoints_found++))
+                    else
+                        log_info "Could not resolve hostname: $ep_host"
+                    fi
+                fi
+            done < "$conf_file"
+        done
+    fi
+    
+    if [[ $endpoints_found -eq 0 ]]; then
+        log_info "No VPN endpoints found in config files"
+    else
+        log_info "Allowing $endpoints_found VPN endpoint(s)"
+    fi
+    
+    # Create nftables rules in a secure temp file
+    local temp_file
+    temp_file=$(mktemp --tmpdir=/run "tonneru-ks.XXXXXXXXXX.nft")
+    chmod 600 "$temp_file"
+    
+    # Write rules to temp file
+    cat > "$temp_file" << EOF
+table inet $NFT_TABLE {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif lo accept
+        iif $interface accept
+        ct state established,related accept
+        # Allow LAN traffic (private IP ranges)
+        ip saddr 10.0.0.0/8 accept
+        ip saddr 172.16.0.0/12 accept
+        ip saddr 192.168.0.0/16 accept
+        ip saddr 169.254.0.0/16 accept
+    }
+    chain output {
+        type filter hook output priority 0; policy drop;
+        oif lo accept
+        oif $interface accept
+        ct state established,related accept
+        # Allow DHCP
+        udp dport 67 accept
+        udp sport 68 accept
+        # Allow LAN traffic (private IP ranges)
+        ip daddr 10.0.0.0/8 accept
+        ip daddr 172.16.0.0/12 accept
+        ip daddr 192.168.0.0/16 accept
+        ip daddr 169.254.0.0/16 accept
+        # Allow DNS (for VPN hostname resolution)
+        udp dport 53 accept
+        tcp dport 53 accept
+        # Allow traffic to ALL configured VPN endpoints
+$endpoint_rules
+    }
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+}
+EOF
+    
+    # Apply rules
+    local result=0
+    /usr/bin/nft -f "$temp_file" || result=$?
+    
+    # Always remove temp file
+    rm -f "$temp_file"
+    
+    if [[ $result -ne 0 ]]; then
+        log_error "Failed to apply kill switch rules"
+        return 1
+    fi
+    
+    log_info "Kill switch enabled"
+    return 0
+}
+
+# Command: killswitch-off
+cmd_killswitch_off() {
+    log_info "Disabling kill switch"
+    
+    # Method 1: Delete our specific table (preferred - surgical removal)
+    /usr/bin/nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+    
+    # Method 2: Double-check it's gone by listing and deleting again if found
+    if /usr/bin/nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        log_info "Table still exists, forcing removal..."
+        /usr/bin/nft flush table inet "$NFT_TABLE" 2>/dev/null || true
+        /usr/bin/nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+    fi
+    
+    # Method 3: If table STILL exists (shouldn't happen), use flush ruleset on our table
+    if /usr/bin/nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        log_error "Kill switch table persists, attempting aggressive removal"
+        # Create empty table definition to overwrite, then delete
+        echo "table inet $NFT_TABLE {}" | /usr/bin/nft -f - 2>/dev/null || true
+        /usr/bin/nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+    fi
+    
+    # Verify removal
+    if /usr/bin/nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        log_error "CRITICAL: Failed to remove kill switch table!"
+        return 1
+    fi
+    
+    log_info "Kill switch disabled successfully"
+    return 0
+}
+
+# Command: killswitch-status
+cmd_killswitch_status() {
+    if /usr/bin/nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        printf 'enabled\n'
+        return 0
+    else
+        printf 'disabled\n'
+        return 1
+    fi
+}
+
+# Command: config-list
+cmd_config_list() {
+    if [[ -d "$WG_CONFIG_DIR" ]]; then
+        ls -1 "$WG_CONFIG_DIR" 2>/dev/null | grep '\.conf$' | sed 's/\.conf$//' || true
+    fi
+}
+
+# Command: config-read <name>
+cmd_config_read() {
+    local name="${1:-}"
+    
+    if ! validate_name "$name" "config"; then
+        return 1
+    fi
+    
+    local config_path="$WG_CONFIG_DIR/$name.conf"
+    
+    if [[ ! -f "$config_path" ]]; then
+        log_error "Config file does not exist: $name"
+        return 1
+    fi
+    
+    cat "$config_path"
+}
+
+# Command: config-write <name>
+# Reads config content from stdin
+cmd_config_write() {
+    local name="${1:-}"
+    
+    if ! validate_name "$name" "config"; then
+        return 1
+    fi
+    
+    local config_path="$WG_CONFIG_DIR/$name.conf"
+    
+    # Create directory if needed
+    if [[ ! -d "$WG_CONFIG_DIR" ]]; then
+        mkdir -p "$WG_CONFIG_DIR"
+        chmod 700 "$WG_CONFIG_DIR"
+    fi
+    
+    # Read content from stdin
+    local content
+    content=$(cat)
+    
+    # Basic validation - must have Interface and Peer sections
+    if ! printf '%s' "$content" | grep -q '^\[Interface\]'; then
+        log_error "Invalid WireGuard config: missing [Interface] section"
+        return 1
+    fi
+    
+    if ! printf '%s' "$content" | grep -q '^\[Peer\]'; then
+        log_error "Invalid WireGuard config: missing [Peer] section"
+        return 1
+    fi
+    
+    log_info "Writing WireGuard config: $name"
+    
+    # Write atomically using temp file
+    local temp_file
+    temp_file=$(mktemp "$WG_CONFIG_DIR/.tonneru-tmp.XXXXXXXXXX")
+    chmod 600 "$temp_file"
+    
+    printf '%s\n' "$content" > "$temp_file"
+    mv "$temp_file" "$config_path"
+    chmod 600 "$config_path"
+    
+    log_info "Config written: $name"
+    return 0
+}
+
+# Command: config-delete <name>
+cmd_config_delete() {
+    local name="${1:-}"
+    
+    if ! validate_name "$name" "config"; then
+        return 1
+    fi
+    
+    local config_path="$WG_CONFIG_DIR/$name.conf"
+    
+    if [[ ! -f "$config_path" ]]; then
+        log_info "Config file does not exist (already deleted?): $name"
+        return 0
+    fi
+    
+    log_info "Deleting WireGuard config: $name"
+    rm -f "$config_path"
+    
+    return 0
+}
+
+# Print usage
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME <command> [args]
+
+Commands:
+    connect <profile>        Connect to WireGuard profile
+    disconnect [interface]   Disconnect from WireGuard (auto-detects if not specified)
+    status                   Show WireGuard status
+    status-interface <name>  Show status for specific interface
+    killswitch-on <iface>    Enable kill switch for interface
+    killswitch-off           Disable kill switch
+    killswitch-status        Check if kill switch is enabled
+    config-list              List available configs
+    config-read <name>       Read config file content
+    config-write <name>      Write config from stdin
+    config-delete <name>     Delete config file
+
+This script should only be called via sudo by the tonneru application.
+EOF
+}
+
+# Main entry point
+main() {
+    local command="${1:-}"
+    shift || true
+    
+    case "$command" in
+        connect)
+            cmd_connect "$@"
+            ;;
+        disconnect)
+            cmd_disconnect "$@"
+            ;;
+        status)
+            cmd_status
+            ;;
+        status-interface)
+            cmd_status_interface "$@"
+            ;;
+        killswitch-on)
+            cmd_killswitch_on "$@"
+            ;;
+        killswitch-off)
+            cmd_killswitch_off
+            ;;
+        killswitch-status)
+            cmd_killswitch_status
+            ;;
+        config-list)
+            cmd_config_list
+            ;;
+        config-read)
+            cmd_config_read "$@"
+            ;;
+        config-write)
+            cmd_config_write "$@"
+            ;;
+        config-delete)
+            cmd_config_delete "$@"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        "")
+            log_error "No command specified"
+            usage >&2
+            return 1
+            ;;
+        *)
+            log_security "Unknown command rejected: $command"
+            log_error "Unknown command: $command"
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
+

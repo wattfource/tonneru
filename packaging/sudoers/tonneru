@@ -1,0 +1,19 @@
+# Sudoers configuration for tonneru VPN manager
+# Install to: /etc/sudoers.d/tonneru
+# Permissions: 0440, owned by root:root
+#
+# This allows members of the 'tonneru' group to manage WireGuard VPN
+# connections through the secure helper script only.
+#
+# Security model:
+# - Single entry point (tonneru-sudo helper script)
+# - All input validation done in the helper
+# - No wildcards or glob patterns
+# - All operations logged to system journal
+#
+# To add a user to the tonneru group:
+#   sudo usermod -aG tonneru $USER
+#   (log out and back in for changes to take effect)
+
+# Allow tonneru group to run the privileged helper without password
+%tonneru ALL=(ALL) NOPASSWD: /usr/lib/tonneru/tonneru-sudo
