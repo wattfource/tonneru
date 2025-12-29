@@ -60,20 +60,10 @@ pkg/
 src/tonneru/
 
 # ===================
-# Private Dev Scripts
+# Private Dev Folder
 # ===================
-# Local development and deployment (not shared)
-deploy-aur.sh
-update.sh
-aur-work/
-
-# ===================
-# Private Documentation
-# ===================
-# Internal docs kept locally, not in public repo
-CHEATSHEET.md
-CONTRIBUTING.md
-docs/
+# Local development scripts and docs (not shared)
+.dev/
 
 # ===================
 # Misc
