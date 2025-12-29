@@ -135,6 +135,8 @@ mod tests {
                 session_vpn: false,
             }],
             default_profile: Some("work-vpn".to_string()),
+            last_connected: None,
+            auto_reconnect: false,
             kill_switch: false,
             notifications: true,
             known_tunnels: vec![TunnelInfo {
