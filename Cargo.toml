@@ -1,6 +1,6 @@
 [package]
 name = "tonneru"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 authors = ["Sean Fournier <me@seanfournier.com>"]
 description = "A TUI-based WireGuard manager with network automation and kill switch"
